@@ -129,6 +129,33 @@ def dflash_generate(
     )
 
 
+def dflash_generate_batch(
+    model: DFlashDraftModel,
+    target: AutoModelForCausalLM,
+    input_ids_batch: list[torch.Tensor],
+    mask_token_id: int,
+    max_new_tokens: int,
+    block_size: int,
+    stop_token_ids: list[int],
+    temperature: float = 0.0,
+) -> list[SimpleNamespace]:
+    responses = []
+    for input_ids in input_ids_batch:
+        responses.append(
+            dflash_generate(
+                model=model,
+                target=target,
+                input_ids=input_ids,
+                mask_token_id=mask_token_id,
+                max_new_tokens=max_new_tokens,
+                block_size=block_size,
+                stop_token_ids=stop_token_ids,
+                temperature=temperature,
+            )
+        )
+    return responses
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-name-or-path", type=str, required=True)
@@ -138,7 +165,11 @@ def main() -> None:
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=16384)
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--batch-size", type=int, default=1)
     args = parser.parse_args()
+
+    if args.batch_size < 1:
+        raise ValueError("--batch-size must be >= 1")
 
     random.seed(0)
     np.random.seed(0)
@@ -182,33 +213,53 @@ def main() -> None:
         dataset = dataset.shuffle(seed=0).select(range(args.max_samples))
 
     responses = []
-    indices = range(dist.rank(), len(dataset), dist.size())
-    for idx in tqdm(indices, disable=not dist.is_main()):
-        instance = dataset[idx]
-        messages = []
-        for turn_index, user_content in enumerate(instance["turns"]):
-            messages.append({"role": "user", "content": user_content})
-            input_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
-            input_ids = tokenizer.encode(input_text, return_tensors="pt").to(target.device)
+    indices = list(range(dist.rank(), len(dataset), dist.size()))
+    for chunk_start in tqdm(range(0, len(indices), args.batch_size), disable=not dist.is_main()):
+        batch_indices = indices[chunk_start : chunk_start + args.batch_size]
+        batch_instances = [dataset[idx] for idx in batch_indices]
+        batch_messages = [[] for _ in batch_instances]
+        max_turns = max(len(instance["turns"]) for instance in batch_instances)
 
-            response = {}
+        for turn_index in range(max_turns):
+            active_rows = []
+            input_ids_batch = []
+            for row, instance in enumerate(batch_instances):
+                if turn_index >= len(instance["turns"]):
+                    continue
+                user_content = instance["turns"][turn_index]
+                batch_messages[row].append({"role": "user", "content": user_content})
+                input_text = tokenizer.apply_chat_template(
+                    batch_messages[row],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=False,
+                )
+                input_ids_batch.append(tokenizer.encode(input_text, return_tensors="pt").to(target.device))
+                active_rows.append(row)
+
+            if not input_ids_batch:
+                continue
+
+            batch_response = {}
             for bs in [1, block_size]:
-                response[bs] = dflash_generate(
+                batch_response[bs] = dflash_generate_batch(
                     model=draft_model,
                     target=target,
-                    input_ids=input_ids,
+                    input_ids_batch=input_ids_batch,
                     mask_token_id=draft_model.mask_token_id,
                     max_new_tokens=args.max_new_tokens,
                     block_size=bs,
                     stop_token_ids=[tokenizer.eos_token_id],
                     temperature=args.temperature,
                 )
-            
-            spec_response = response[block_size]
-            generated_ids = spec_response.output_ids[0, spec_response.num_input_tokens:]
-            output_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
-            messages.append({"role": "assistant", "content": output_text})
-            responses.append(response)
+
+            for local_i, row in enumerate(active_rows):
+                response = {1: batch_response[1][local_i], block_size: batch_response[block_size][local_i]}
+                spec_response = response[block_size]
+                generated_ids = spec_response.output_ids[0, spec_response.num_input_tokens:]
+                output_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+                batch_messages[row].append({"role": "assistant", "content": output_text})
+                responses.append(response)
 
     if dist.size() > 1:
         responses = dist.gather(responses, dst=0)
