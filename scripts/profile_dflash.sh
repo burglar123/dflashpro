@@ -49,7 +49,12 @@ ncu \
   --target-processes all \
   --set full \
   --nvtx \
-  --nvtx-include "diffusion.attention_ffn,target.verify.attention_ffn,kv_update.draft_cache,kv_update.target_cache" \
+  --nvtx-include "diffusion.attn/" \
+  --nvtx-include "diffusion.ffn/" \
+  --nvtx-include "target.verify.attn/" \
+  --nvtx-include "target.verify.ffn/" \
+  --nvtx-include "kv_update.draft_cache/" \
+  --nvtx-include "kv_update.target_cache/" \
   -o "$NCU_OUT" \
   python benchmark.py "${COMMON_ARGS[@]}"
 

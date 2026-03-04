@@ -31,6 +31,66 @@ def nvtx_range(name: str):
             torch.cuda.nvtx.range_pop()
 
 
+_CURRENT_PROFILE_PHASE: str | None = None
+
+
+@contextmanager
+def profile_phase(name: str | None):
+    global _CURRENT_PROFILE_PHASE
+    prev = _CURRENT_PROFILE_PHASE
+    _CURRENT_PROFILE_PHASE = name
+    try:
+        yield
+    finally:
+        _CURRENT_PROFILE_PHASE = prev
+
+
+class ModuleRangeProfiler:
+    def __init__(self, root: torch.nn.Module):
+        self._handles = []
+        for module_name, module in root.named_modules():
+            kind = self._classify_kind(module_name, module)
+            if kind is None:
+                continue
+            self._handles.append(
+                module.register_forward_pre_hook(self._make_pre_hook(kind), with_kwargs=True)
+            )
+            self._handles.append(module.register_forward_hook(self._post_hook, with_kwargs=True))
+
+    @staticmethod
+    def _classify_kind(module_name: str, module: torch.nn.Module) -> str | None:
+        lowered = f"{module_name}.{module.__class__.__name__}".lower()
+        if any(token in lowered for token in ["self_attn", "attention", ".attn", "attn"]):
+            return "attn"
+        if any(token in lowered for token in ["mlp", "ffn", "feed_forward"]):
+            return "ffn"
+        return None
+
+    @staticmethod
+    def _make_pre_hook(kind: str):
+        def _pre_hook(module, args, kwargs):
+            if not torch.cuda.is_available():
+                module._dflash_nvtx_push = False
+                return
+            if _CURRENT_PROFILE_PHASE is None:
+                module._dflash_nvtx_push = False
+                return
+            torch.cuda.nvtx.range_push(f"{_CURRENT_PROFILE_PHASE}.{kind}")
+            module._dflash_nvtx_push = True
+
+        return _pre_hook
+
+    @staticmethod
+    def _post_hook(module, args, kwargs, output):
+        if not torch.cuda.is_available():
+            return output
+        pushed = getattr(module, "_dflash_nvtx_push", False)
+        if pushed:
+            torch.cuda.nvtx.range_pop()
+            module._dflash_nvtx_push = False
+        return output
+
+
 def cuda_time() -> float:
     torch.cuda.synchronize()
     return time.perf_counter()
@@ -89,18 +149,19 @@ def dflash_generate(
         block_output_ids = output_ids[:, start : start + block_size].clone()
         block_position_ids = position_ids[:, start : start + block_size]
         if block_size > 1:
-            with nvtx_range("diffusion.attention_ffn"):
-                noise_embedding = target.model.embed_tokens(block_output_ids)
-                draft_hidden = model(
-                    target_hidden=target_hidden,
-                    noise_embedding=noise_embedding,
-                    position_ids=position_ids[
-                        :, past_key_values_draft.get_seq_length() : start + block_size
-                    ],
-                    past_key_values=past_key_values_draft,
-                    use_cache=True,
-                    is_causal=False,
-                )
+            with profile_phase("diffusion"):
+                with nvtx_range("diffusion.forward"):
+                    noise_embedding = target.model.embed_tokens(block_output_ids)
+                    draft_hidden = model(
+                        target_hidden=target_hidden,
+                        noise_embedding=noise_embedding,
+                        position_ids=position_ids[
+                            :, past_key_values_draft.get_seq_length() : start + block_size
+                        ],
+                        past_key_values=past_key_values_draft,
+                        use_cache=True,
+                        is_causal=False,
+                    )
             with nvtx_range("diffusion.output_head"):
                 draft_logits = target.lm_head(draft_hidden[:, -block_size + 1 :, :])
             with nvtx_range("kv_update.draft_cache"):
@@ -110,14 +171,15 @@ def dflash_generate(
                 draft_prefill = False
                 decode_start = cuda_time()
 
-        with nvtx_range("target.verify.attention_ffn"):
-            output = target(
-                block_output_ids,
-                position_ids=block_position_ids,
-                past_key_values=past_key_values_target,
-                use_cache=True,
-                output_hidden_states=True if block_size > 1 else False,
-            )
+        with profile_phase("target.verify"):
+            with nvtx_range("target.verify.forward"):
+                output = target(
+                    block_output_ids,
+                    position_ids=block_position_ids,
+                    past_key_values=past_key_values_target,
+                    use_cache=True,
+                    output_hidden_states=True if block_size > 1 else False,
+                )
 
         posterior = sample(output.logits, temperature)
         acceptance_length = (
@@ -247,6 +309,12 @@ def main() -> None:
         attn_implementation="flash_attention_2" if installed_flash_attn else "sdpa",
         dtype=torch.bfloat16,
     ).to(device).eval()
+
+    # Required profiling ranges:
+    # - diffusion.attn / diffusion.ffn
+    # - target.verify.attn / target.verify.ffn
+    ModuleRangeProfiler(target)
+    ModuleRangeProfiler(draft_model)
 
     block_size = args.block_size if args.block_size is not None else draft_model.block_size
 
