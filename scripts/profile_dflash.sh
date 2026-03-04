@@ -49,8 +49,10 @@ ncu \
   --target-processes all \
   --set full \
   --nvtx \
-  --nvtx-include "diffusion.attn/" \
-  --nvtx-include "diffusion.ffn/" \
+  --nvtx-include "draft.qkv/" \
+  --nvtx-include "draft.attn/" \
+  --nvtx-include "draft.ffn/" \
+  --nvtx-include "target.verify.qkv/" \
   --nvtx-include "target.verify.attn/" \
   --nvtx-include "target.verify.ffn/" \
   --nvtx-include "kv_update.draft_cache/" \

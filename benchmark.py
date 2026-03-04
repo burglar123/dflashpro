@@ -60,6 +60,19 @@ class ModuleRangeProfiler:
     @staticmethod
     def _classify_kind(module_name: str, module: torch.nn.Module) -> str | None:
         lowered = f"{module_name}.{module.__class__.__name__}".lower()
+        if any(
+            token in lowered
+            for token in [
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "qkv",
+                "wqkv",
+                "query_key_value",
+                "c_attn",
+            ]
+        ):
+            return "qkv"
         if any(token in lowered for token in ["self_attn", "attention", ".attn", "attn"]):
             return "attn"
         if any(token in lowered for token in ["mlp", "ffn", "feed_forward"]):
@@ -149,8 +162,8 @@ def dflash_generate(
         block_output_ids = output_ids[:, start : start + block_size].clone()
         block_position_ids = position_ids[:, start : start + block_size]
         if block_size > 1:
-            with profile_phase("diffusion"):
-                with nvtx_range("diffusion.forward"):
+            with profile_phase("draft"):
+                with nvtx_range("draft.forward"):
                     noise_embedding = target.model.embed_tokens(block_output_ids)
                     draft_hidden = model(
                         target_hidden=target_hidden,
@@ -162,7 +175,7 @@ def dflash_generate(
                         use_cache=True,
                         is_causal=False,
                     )
-            with nvtx_range("diffusion.output_head"):
+            with nvtx_range("draft.output_head"):
                 draft_logits = target.lm_head(draft_hidden[:, -block_size + 1 :, :])
             with nvtx_range("kv_update.draft_cache"):
                 past_key_values_draft.crop(start)
@@ -311,8 +324,8 @@ def main() -> None:
     ).to(device).eval()
 
     # Required profiling ranges:
-    # - diffusion.attn / diffusion.ffn
-    # - target.verify.attn / target.verify.ffn
+    # - draft.qkv / draft.attn / draft.ffn
+    # - target.verify.qkv / target.verify.attn / target.verify.ffn
     ModuleRangeProfiler(target)
     ModuleRangeProfiler(draft_model)
 
