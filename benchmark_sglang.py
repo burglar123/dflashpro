@@ -113,7 +113,7 @@ def _run_bench_requests(
     batch_requests: bool,
     stop: list[str],
     timeout_s: int,
-    expect_dflash: bool,
+    expect_speculative: bool,
 ) -> BenchMetrics:
     # Drop the first batch from metrics to exclude one-time JIT/cuda-graph overhead
     bs = max(int(concurrency), 1)
@@ -203,10 +203,10 @@ def _run_bench_requests(
     latency = time.perf_counter() - start
     toks_per_s = total_tokens / max(latency, 1e-6)
 
-    if expect_dflash and spec_verify_ct_sum <= 0:
+    if expect_speculative and spec_verify_ct_sum <= 0:
         raise RuntimeError(
-            "DFLASH sanity check failed: did not observe any `spec_verify_ct` in responses "
-            "(DFLASH may not have been enabled)."
+            "Speculative decode sanity check failed: did not observe any `spec_verify_ct` in responses "
+            "(speculative algorithm may not have been enabled)."
         )
 
     spec_accept_length = (
@@ -253,9 +253,56 @@ def main() -> None:
     parser.add_argument("--target-model", type=str, default="Qwen/Qwen3-8B")
     parser.add_argument("--draft-model", type=str, default="z-lab/Qwen3-8B-DFlash-b16")
     parser.add_argument(
+        "--eagle-draft-model",
+        type=str,
+        default=None,
+        help="Draft model path for EAGLE. If unset, EAGLE sweep is skipped.",
+    )
+    parser.add_argument(
+        "--eagle-algorithm",
+        type=str,
+        default="EAGLE3",
+        choices=["EAGLE", "EAGLE3"],
+        help="Speculative algorithm for eagle draft model.",
+    )
+    parser.add_argument(
+        "--eagle-num-steps",
+        type=int,
+        default=None,
+        help="Override --speculative-num-steps for EAGLE/EAGLE3.",
+    )
+    parser.add_argument(
+        "--eagle-num-draft-tokens",
+        type=int,
+        default=None,
+        help="Override --speculative-num-draft-tokens for EAGLE/EAGLE3.",
+    )
+    parser.add_argument(
+        "--eagle-topk",
+        type=int,
+        default=None,
+        help="Override --speculative-eagle-topk for EAGLE/EAGLE3.",
+    )
+    parser.add_argument(
+        "--enable-multi-layer-eagle",
+        action="store_true",
+        help="Pass --enable-multi-layer-eagle to SGLang server.",
+    )
+    parser.add_argument(
+        "--dflash-block-size",
+        type=int,
+        default=None,
+        help="Override --speculative-dflash-block-size for DFLASH.",
+    )
+    parser.add_argument(
         "--skip-baseline",
         action="store_true",
         help="Skip running the baseline (target-only) sweep; only run DFLASH and report N/A for baseline/speedup.",
+    )
+    parser.add_argument(
+        "--skip-eagle",
+        action="store_true",
+        help="Skip running EAGLE sweep even when --eagle-draft-model is provided.",
     )
     parser.add_argument(
         "--batch-requests",
@@ -356,6 +403,8 @@ def main() -> None:
     baseline_toks: dict[tuple[str, int], Optional[float]] = {}
     dflash_toks: dict[tuple[str, int], Optional[float]] = {}
     dflash_accept_len: dict[tuple[str, int], Optional[float]] = {}
+    eagle_toks: dict[tuple[str, int], Optional[float]] = {}
+    eagle_accept_len: dict[tuple[str, int], Optional[float]] = {}
     
     tp = args.tp_size  # Fixed TP size
 
@@ -415,7 +464,7 @@ def main() -> None:
                         batch_requests=bool(args.batch_requests),
                         stop=[],
                         timeout_s=int(args.timeout_s),
-                        expect_dflash=False,
+                        expect_speculative=False,
                     )
                     baseline_toks[(backend, conc)] = metrics.output_toks_per_s
                     print(
@@ -433,17 +482,23 @@ def main() -> None:
         print(f"\n=== backend={backend} tp={tp} (DFLASH) ===")
         dflash_port = find_available_port(port_base + 1)
         dflash_url = f"http://127.0.0.1:{dflash_port}"
+        dflash_server_args: list[str] = [
+            *common_server_args,
+            "--speculative-algorithm",
+            "DFLASH",
+            "--speculative-draft-model-path",
+            args.draft_model,
+        ]
+        if args.dflash_block_size is not None:
+            dflash_server_args.extend(
+                ["--speculative-dflash-block-size", str(args.dflash_block_size)]
+            )
+
         dflash_proc = popen_launch_server(
             args.target_model,
             dflash_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                *common_server_args,
-                "--speculative-algorithm",
-                "DFLASH",
-                "--speculative-draft-model-path",
-                args.draft_model,
-            ],
+            other_args=dflash_server_args,
         )
         try:
             _send_generate(
@@ -467,15 +522,20 @@ def main() -> None:
                     batch_requests=bool(args.batch_requests),
                     stop=[],
                     timeout_s=int(args.timeout_s),
-                    expect_dflash=True,
+                    expect_speculative=True,
                 )
                 dflash_toks[(backend, conc)] = metrics.output_toks_per_s
                 dflash_accept_len[(backend, conc)] = metrics.spec_accept_length
+                accept_len_str = (
+                    f"{metrics.spec_accept_length:.3f}"
+                    if metrics.spec_accept_length is not None
+                    else "N/A"
+                )
                 print(
                     f"[DFLASH]   conc={conc:>2} n={n:<4} "
                     f"toks/s={metrics.output_toks_per_s:,.2f} "
                     f"latency={metrics.latency_s:.1f}s "
-                    f"accept_len={metrics.spec_accept_length:.3f} "
+                    f"accept_len={accept_len_str} "
                     f"spec_verify_ct_sum={metrics.spec_verify_ct_sum}"
                 )
         finally:
@@ -485,14 +545,94 @@ def main() -> None:
             except Exception:
                 pass
 
+        if args.eagle_draft_model and not args.skip_eagle:
+            print(f"\n=== backend={backend} tp={tp} ({args.eagle_algorithm}) ===")
+            eagle_port = find_available_port(port_base + 2)
+            eagle_url = f"http://127.0.0.1:{eagle_port}"
+            eagle_server_args: list[str] = [
+                *common_server_args,
+                "--speculative-algorithm",
+                args.eagle_algorithm,
+                "--speculative-draft-model-path",
+                args.eagle_draft_model,
+            ]
+            if args.eagle_num_steps is not None:
+                eagle_server_args.extend(["--speculative-num-steps", str(args.eagle_num_steps)])
+            if args.eagle_num_draft_tokens is not None:
+                eagle_server_args.extend(
+                    ["--speculative-num-draft-tokens", str(args.eagle_num_draft_tokens)]
+                )
+            if args.eagle_topk is not None:
+                eagle_server_args.extend(["--speculative-eagle-topk", str(args.eagle_topk)])
+            if args.enable_multi_layer_eagle:
+                eagle_server_args.append("--enable-multi-layer-eagle")
+
+            eagle_proc = popen_launch_server(
+                args.target_model,
+                eagle_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=eagle_server_args,
+            )
+            try:
+                _send_generate(
+                    eagle_url,
+                    "Hello",
+                    max_new_tokens=8,
+                    stop=[],
+                    timeout_s=min(int(args.timeout_s), 300),
+                )
+                for conc in concurrencies:
+                    n = num_questions_by_conc[conc]
+                    _flush_cache(eagle_url)
+                    print(
+                        f"[warmup] run 1 warmup batch (size={conc}) after /flush_cache; excluded from metrics."
+                    )
+                    metrics = _run_bench_requests(
+                        eagle_url,
+                        prompts=prompts[: n + conc],
+                        max_new_tokens=int(args.max_new_tokens),
+                        concurrency=int(conc),
+                        batch_requests=bool(args.batch_requests),
+                        stop=[],
+                        timeout_s=int(args.timeout_s),
+                        expect_speculative=True,
+                    )
+                    eagle_toks[(backend, conc)] = metrics.output_toks_per_s
+                    eagle_accept_len[(backend, conc)] = metrics.spec_accept_length
+                    accept_len_str = (
+                        f"{metrics.spec_accept_length:.3f}"
+                        if metrics.spec_accept_length is not None
+                        else "N/A"
+                    )
+                    print(
+                        f"[EAGLE]    conc={conc:>2} n={n:<4} "
+                        f"toks/s={metrics.output_toks_per_s:,.2f} "
+                        f"latency={metrics.latency_s:.1f}s "
+                        f"accept_len={accept_len_str} "
+                        f"spec_verify_ct_sum={metrics.spec_verify_ct_sum}"
+                    )
+            finally:
+                kill_process_tree(eagle_proc.pid)
+                try:
+                    eagle_proc.wait(timeout=30)
+                except Exception:
+                    pass
+
     # Render markdown.
     md_lines: list[str] = []
-    md_lines.append("# DFLASH Bench Report")
+    md_lines.append("# Speculative Decoding Bench Report")
     md_lines.append("")
     md_lines.append("## Settings")
     md_lines.append(f"- dataset: `{args.dataset_name}`")
     md_lines.append(f"- target_model: `{args.target_model}`")
     md_lines.append(f"- draft_model: `{args.draft_model}`")
+    md_lines.append(f"- dflash_block_size: `{args.dflash_block_size}`")
+    md_lines.append(f"- eagle_draft_model: `{args.eagle_draft_model}`")
+    md_lines.append(f"- eagle_algorithm: `{args.eagle_algorithm}`")
+    md_lines.append(f"- eagle_num_steps: `{args.eagle_num_steps}`")
+    md_lines.append(f"- eagle_num_draft_tokens: `{args.eagle_num_draft_tokens}`")
+    md_lines.append(f"- eagle_topk: `{args.eagle_topk}`")
+    md_lines.append(f"- enable_multi_layer_eagle: `{bool(args.enable_multi_layer_eagle)}`")
     md_lines.append(f"- max_new_tokens: `{args.max_new_tokens}`")
     md_lines.append(f"- attention_backends: `{', '.join(attention_backends)}`")
     md_lines.append(f"- tp_size: `{tp}`")
@@ -501,6 +641,7 @@ def main() -> None:
     md_lines.append(f"- device_sm: `{device_sm}`")
     md_lines.append(f"- is_blackwell: `{is_blackwell}`")
     md_lines.append(f"- skip_baseline: `{bool(args.skip_baseline)}`")
+    md_lines.append(f"- skip_eagle: `{bool(args.skip_eagle)}`")
     md_lines.append("- drop_first_batch: `true`")
     md_lines.append("")
 
@@ -514,17 +655,33 @@ def main() -> None:
         dflash_values = {
             c: dflash_toks.get((backend, c), None) for c in concurrencies
         }
+        eagle_values = {
+            c: eagle_toks.get((backend, c), None) for c in concurrencies
+        }
         speedup_values: dict[int, Optional[float]] = {}
+        dflash_vs_eagle_values: dict[int, Optional[float]] = {}
         for c in concurrencies:
             b = baseline_values.get(c, None)
             d = dflash_values.get(c, None)
+            e = eagle_values.get(c, None)
             speedup_values[c] = None if (b is None or d is None or b <= 0) else (d / b)
+            dflash_vs_eagle_values[c] = None if (e is None or d is None or e <= 0) else (d / e)
 
         md_lines.append("### Baseline output tok/s")
         md_lines.append(
             _format_table(
                 concurrencies=concurrencies,
                 values=baseline_values,
+                float_fmt=",.2f",
+            )
+        )
+        md_lines.append("")
+
+        md_lines.append("### EAGLE output tok/s")
+        md_lines.append(
+            _format_table(
+                concurrencies=concurrencies,
+                values=eagle_values,
                 float_fmt=",.2f",
             )
         )
@@ -540,11 +697,34 @@ def main() -> None:
         )
         md_lines.append("")
 
+        md_lines.append("### Speedup (DFLASH / EAGLE)")
+        md_lines.append(
+            _format_table(
+                concurrencies=concurrencies,
+                values=dflash_vs_eagle_values,
+                float_fmt=".3f",
+            )
+        )
+        md_lines.append("")
+
         md_lines.append("### Speedup (DFLASH / baseline)")
         md_lines.append(
             _format_table(
                 concurrencies=concurrencies,
                 values=speedup_values,
+                float_fmt=".3f",
+            )
+        )
+        md_lines.append("")
+
+        md_lines.append("### EAGLE acceptance length")
+        md_lines.append(
+            _format_table(
+                concurrencies=concurrencies,
+                values={
+                    c: eagle_accept_len.get((backend, c), None)
+                    for c in concurrencies
+                },
                 float_fmt=".3f",
             )
         )
