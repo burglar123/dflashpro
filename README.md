@@ -131,6 +131,7 @@ python benchmark_sglang.py \
   --eagle-algorithm EAGLE3 \
   --eagle-num-steps 5 \
   --eagle-num-draft-tokens 5 \
+  --eagle-topk 1 \
   --concurrencies 1,4,8,16,32 \
   --dataset-name math500 \
   --attention-backends fa3,flashinfer \
@@ -138,7 +139,7 @@ python benchmark_sglang.py \
   --output-md sglang_results.md
 ```
 
-`benchmark_sglang.py` supports baseline + DFLASH + EAGLE runs, and reports DFLASH/EAGLE speedup in markdown output. You can tune DFLASH/EAGLE depth via `--dflash-block-size` and `--eagle-num-steps` / `--eagle-num-draft-tokens`.
+`benchmark_sglang.py` supports baseline + DFLASH + EAGLE runs, and reports DFLASH/EAGLE speedup in markdown output. You can tune DFLASH/EAGLE depth via `--dflash-block-size` and `--eagle-num-steps` / `--eagle-num-draft-tokens`; `--eagle-topk` defaults to `1`.
 
 <div align="center">
   <img src="assets/dflash_results.png" width="100%">

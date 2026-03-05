@@ -280,8 +280,8 @@ def main() -> None:
     parser.add_argument(
         "--eagle-topk",
         type=int,
-        default=None,
-        help="Override --speculative-eagle-topk for EAGLE/EAGLE3.",
+        default=1,
+        help="Value for --speculative-eagle-topk for EAGLE/EAGLE3 (default: 1).",
     )
     parser.add_argument(
         "--enable-multi-layer-eagle",
@@ -562,8 +562,7 @@ def main() -> None:
                 eagle_server_args.extend(
                     ["--speculative-num-draft-tokens", str(args.eagle_num_draft_tokens)]
                 )
-            if args.eagle_topk is not None:
-                eagle_server_args.extend(["--speculative-eagle-topk", str(args.eagle_topk)])
+            eagle_server_args.extend(["--speculative-eagle-topk", str(args.eagle_topk)])
             if args.enable_multi_layer_eagle:
                 eagle_server_args.append("--enable-multi-layer-eagle")
 
