@@ -126,6 +126,7 @@ export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
 python benchmark_sglang.py \
   --target-model Qwen/Qwen3-8B \
   --draft-model z-lab/Qwen3-8B-DFlash-b16 \
+  --dflash-block-size 8 \
   --eagle-draft-model <your-eagle-draft-model> \
   --eagle-algorithm EAGLE3 \
   --eagle-num-steps 5 \
@@ -137,7 +138,7 @@ python benchmark_sglang.py \
   --output-md sglang_results.md
 ```
 
-`benchmark_sglang.py` supports baseline + DFLASH + EAGLE runs, and reports DFLASH/EAGLE speedup in markdown output. You can tune EAGLE depth via `--eagle-num-steps` / `--eagle-num-draft-tokens`.
+`benchmark_sglang.py` supports baseline + DFLASH + EAGLE runs, and reports DFLASH/EAGLE speedup in markdown output. You can tune DFLASH/EAGLE depth via `--dflash-block-size` and `--eagle-num-steps` / `--eagle-num-draft-tokens`.
 
 <div align="center">
   <img src="assets/dflash_results.png" width="100%">

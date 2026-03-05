@@ -289,6 +289,12 @@ def main() -> None:
         help="Pass --enable-multi-layer-eagle to SGLang server.",
     )
     parser.add_argument(
+        "--dflash-block-size",
+        type=int,
+        default=None,
+        help="Override --speculative-dflash-block-size for DFLASH.",
+    )
+    parser.add_argument(
         "--skip-baseline",
         action="store_true",
         help="Skip running the baseline (target-only) sweep; only run DFLASH and report N/A for baseline/speedup.",
@@ -476,17 +482,23 @@ def main() -> None:
         print(f"\n=== backend={backend} tp={tp} (DFLASH) ===")
         dflash_port = find_available_port(port_base + 1)
         dflash_url = f"http://127.0.0.1:{dflash_port}"
+        dflash_server_args: list[str] = [
+            *common_server_args,
+            "--speculative-algorithm",
+            "DFLASH",
+            "--speculative-draft-model-path",
+            args.draft_model,
+        ]
+        if args.dflash_block_size is not None:
+            dflash_server_args.extend(
+                ["--speculative-dflash-block-size", str(args.dflash_block_size)]
+            )
+
         dflash_proc = popen_launch_server(
             args.target_model,
             dflash_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                *common_server_args,
-                "--speculative-algorithm",
-                "DFLASH",
-                "--speculative-draft-model-path",
-                args.draft_model,
-            ],
+            other_args=dflash_server_args,
         )
         try:
             _send_generate(
@@ -614,6 +626,7 @@ def main() -> None:
     md_lines.append(f"- dataset: `{args.dataset_name}`")
     md_lines.append(f"- target_model: `{args.target_model}`")
     md_lines.append(f"- draft_model: `{args.draft_model}`")
+    md_lines.append(f"- dflash_block_size: `{args.dflash_block_size}`")
     md_lines.append(f"- eagle_draft_model: `{args.eagle_draft_model}`")
     md_lines.append(f"- eagle_algorithm: `{args.eagle_algorithm}`")
     md_lines.append(f"- eagle_num_steps: `{args.eagle_num_steps}`")
