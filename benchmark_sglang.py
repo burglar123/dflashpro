@@ -259,6 +259,36 @@ def main() -> None:
         help="Draft model path for EAGLE. If unset, EAGLE sweep is skipped.",
     )
     parser.add_argument(
+        "--eagle-algorithm",
+        type=str,
+        default="EAGLE3",
+        choices=["EAGLE", "EAGLE3"],
+        help="Speculative algorithm for eagle draft model.",
+    )
+    parser.add_argument(
+        "--eagle-num-steps",
+        type=int,
+        default=None,
+        help="Override --speculative-num-steps for EAGLE/EAGLE3.",
+    )
+    parser.add_argument(
+        "--eagle-num-draft-tokens",
+        type=int,
+        default=None,
+        help="Override --speculative-num-draft-tokens for EAGLE/EAGLE3.",
+    )
+    parser.add_argument(
+        "--eagle-topk",
+        type=int,
+        default=None,
+        help="Override --speculative-eagle-topk for EAGLE/EAGLE3.",
+    )
+    parser.add_argument(
+        "--enable-multi-layer-eagle",
+        action="store_true",
+        help="Pass --enable-multi-layer-eagle to SGLang server.",
+    )
+    parser.add_argument(
         "--skip-baseline",
         action="store_true",
         help="Skip running the baseline (target-only) sweep; only run DFLASH and report N/A for baseline/speedup.",
@@ -504,20 +534,32 @@ def main() -> None:
                 pass
 
         if args.eagle_draft_model and not args.skip_eagle:
-            print(f"\n=== backend={backend} tp={tp} (EAGLE) ===")
+            print(f"\n=== backend={backend} tp={tp} ({args.eagle_algorithm}) ===")
             eagle_port = find_available_port(port_base + 2)
             eagle_url = f"http://127.0.0.1:{eagle_port}"
+            eagle_server_args: list[str] = [
+                *common_server_args,
+                "--speculative-algorithm",
+                args.eagle_algorithm,
+                "--speculative-draft-model-path",
+                args.eagle_draft_model,
+            ]
+            if args.eagle_num_steps is not None:
+                eagle_server_args.extend(["--speculative-num-steps", str(args.eagle_num_steps)])
+            if args.eagle_num_draft_tokens is not None:
+                eagle_server_args.extend(
+                    ["--speculative-num-draft-tokens", str(args.eagle_num_draft_tokens)]
+                )
+            if args.eagle_topk is not None:
+                eagle_server_args.extend(["--speculative-eagle-topk", str(args.eagle_topk)])
+            if args.enable_multi_layer_eagle:
+                eagle_server_args.append("--enable-multi-layer-eagle")
+
             eagle_proc = popen_launch_server(
                 args.target_model,
                 eagle_url,
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=[
-                    *common_server_args,
-                    "--speculative-algorithm",
-                    "EAGLE",
-                    "--speculative-draft-model-path",
-                    args.eagle_draft_model,
-                ],
+                other_args=eagle_server_args,
             )
             try:
                 _send_generate(
@@ -573,6 +615,11 @@ def main() -> None:
     md_lines.append(f"- target_model: `{args.target_model}`")
     md_lines.append(f"- draft_model: `{args.draft_model}`")
     md_lines.append(f"- eagle_draft_model: `{args.eagle_draft_model}`")
+    md_lines.append(f"- eagle_algorithm: `{args.eagle_algorithm}`")
+    md_lines.append(f"- eagle_num_steps: `{args.eagle_num_steps}`")
+    md_lines.append(f"- eagle_num_draft_tokens: `{args.eagle_num_draft_tokens}`")
+    md_lines.append(f"- eagle_topk: `{args.eagle_topk}`")
+    md_lines.append(f"- enable_multi_layer_eagle: `{bool(args.enable_multi_layer_eagle)}`")
     md_lines.append(f"- max_new_tokens: `{args.max_new_tokens}`")
     md_lines.append(f"- attention_backends: `{', '.join(attention_backends)}`")
     md_lines.append(f"- tp_size: `{tp}`")
