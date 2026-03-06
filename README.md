@@ -175,17 +175,29 @@ python benchmark_sglang.py \
   --output-md profiles/sglang_client.md
 ```
 
-3) System-level timeline first (`nsys`), then hotspot deep-dive (`ncu`):
+3) System-level timeline first (`nsys`)；`ncu` 可单独再跑（更慢）：
 
 ```bash
 TARGET_MODEL=Qwen/Qwen3-8B \
 DRAFT_MODEL=z-lab/Qwen3-8B-DFlash-b16 \
 SERVER_MODE=dflash \
 CONCURRENCIES=1,8,32 \
+PROFILE_STAGE=nsys \
 ./scripts/profile_sglang_server.sh
 ```
 
-The helper script keeps server/client separated, gracefully stops the profiled server for report flush, and uses kernel-name filtering for `ncu` (no dependence on legacy Python NVTX tags).
+4) 如果确认了热点，再单独跑 `ncu`：
+
+```bash
+TARGET_MODEL=Qwen/Qwen3-8B \
+DRAFT_MODEL=z-lab/Qwen3-8B-DFlash-b16 \
+SERVER_MODE=dflash \
+CONCURRENCIES=1,8,32 \
+PROFILE_STAGE=ncu \
+./scripts/profile_sglang_server.sh
+```
+
+`scripts/profile_sglang_server.sh` 现在支持 `PROFILE_STAGE=nsys|ncu|both`，默认 `both`。脚本会保持 server/client 分离、优雅停止 profiled server 以保证报告落盘，并在 `ncu` 中使用 kernel-name 过滤（不依赖旧的 Python NVTX 名称）。
 
 <div align="center">
   <img src="assets/dflash_results.png" width="100%">
