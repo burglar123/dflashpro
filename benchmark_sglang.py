@@ -6,6 +6,7 @@ import statistics
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Optional
+from urllib.parse import urlparse
 
 import requests
 import torch
@@ -19,6 +20,19 @@ from sglang.test.test_utils import (
     find_available_port,
     popen_launch_server,
 )
+
+
+def _normalize_base_url(url: str) -> str:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        raise RuntimeError(
+            f"Invalid --server-url '{url}'. Expected an http(s) URL, e.g. http://127.0.0.1:30000"
+        )
+    if not parsed.netloc:
+        raise RuntimeError(
+            f"Invalid --server-url '{url}'. Missing host:port, e.g. http://127.0.0.1:30000"
+        )
+    return url.rstrip("/")
 
 def _is_blackwell() -> bool:
     if envs.IS_BLACKWELL.get():
@@ -345,6 +359,29 @@ def main() -> None:
         default="flashinfer,fa3,fa4",
         help="Comma-separated list. Will auto-skip fa3 unless SM90 (Hopper), and fa4 unless SM100+ (Blackwell).",
     )
+    parser.add_argument(
+        "--server-url",
+        type=str,
+        default=None,
+        help=(
+            "If set, do not spawn/kill SGLang server subprocesses. Send all traffic to this existing server URL "
+            "(e.g. http://127.0.0.1:30000). Intended for nsys/ncu profiling workflows."
+        ),
+    )
+    parser.add_argument(
+        "--server-label",
+        type=str,
+        default="external",
+        help="Label used in markdown output when --server-url is set.",
+    )
+    parser.add_argument(
+        "--server-expect-speculative",
+        action="store_true",
+        help=(
+            "When using --server-url, require speculative decode counters in responses "
+            "(same sanity check as DFLASH/EAGLE runs)."
+        ),
+    )
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -365,11 +402,15 @@ def main() -> None:
     attention_backends = [s.strip() for s in args.attention_backends.split(",") if s.strip()]
     is_blackwell = _is_blackwell()
     device_sm = get_device_sm()
-    if device_sm != 90:
-        attention_backends = [b for b in attention_backends if b != "fa3"]
-    if device_sm < 100:
-        attention_backends = [b for b in attention_backends if b != "fa4"]
-    attention_backends = attention_backends or ["flashinfer"]
+    if args.server_url:
+        server_url = _normalize_base_url(args.server_url)
+        attention_backends = [args.server_label]
+    else:
+        if device_sm != 90:
+            attention_backends = [b for b in attention_backends if b != "fa3"]
+        if device_sm < 100:
+            attention_backends = [b for b in attention_backends if b != "fa4"]
+        attention_backends = attention_backends or ["flashinfer"]
 
     # --- Load Data using the new function ---
     print(f"Loading dataset: {args.dataset_name}...")
@@ -409,6 +450,47 @@ def main() -> None:
     tp = args.tp_size  # Fixed TP size
 
     for backend in attention_backends:
+        if args.server_url:
+            print(f"\n=== backend={backend} (external server mode) ===")
+            _send_generate(
+                server_url,
+                "Hello",
+                max_new_tokens=8,
+                stop=[],
+                timeout_s=min(int(args.timeout_s), 300),
+            )
+            for conc in concurrencies:
+                n = num_questions_by_conc[conc]
+                _flush_cache(server_url)
+                print(
+                    f"[warmup] run 1 warmup batch (size={conc}) after /flush_cache; excluded from metrics."
+                )
+                metrics = _run_bench_requests(
+                    server_url,
+                    prompts=prompts[: n + conc],
+                    max_new_tokens=int(args.max_new_tokens),
+                    concurrency=int(conc),
+                    batch_requests=bool(args.batch_requests),
+                    stop=[],
+                    timeout_s=int(args.timeout_s),
+                    expect_speculative=bool(args.server_expect_speculative),
+                )
+                dflash_toks[(backend, conc)] = metrics.output_toks_per_s
+                dflash_accept_len[(backend, conc)] = metrics.spec_accept_length
+                accept_len_str = (
+                    f"{metrics.spec_accept_length:.3f}"
+                    if metrics.spec_accept_length is not None
+                    else "N/A"
+                )
+                print(
+                    f"[external] conc={conc:>2} n={n:<4} "
+                    f"toks/s={metrics.output_toks_per_s:,.2f} "
+                    f"latency={metrics.latency_s:.1f}s "
+                    f"accept_len={accept_len_str} "
+                    f"spec_verify_ct_sum={metrics.spec_verify_ct_sum}"
+                )
+            continue
+
         port_base = find_available_port(20000)
 
         common_server_args: list[str] = [
@@ -634,6 +716,8 @@ def main() -> None:
     md_lines.append(f"- enable_multi_layer_eagle: `{bool(args.enable_multi_layer_eagle)}`")
     md_lines.append(f"- max_new_tokens: `{args.max_new_tokens}`")
     md_lines.append(f"- attention_backends: `{', '.join(attention_backends)}`")
+    md_lines.append(f"- server_url: `{args.server_url}`")
+    md_lines.append(f"- server_expect_speculative: `{bool(args.server_expect_speculative)}`")
     md_lines.append(f"- tp_size: `{tp}`")
     md_lines.append(f"- concurrencies: `{', '.join(str(x) for x in concurrencies)}`")
     md_lines.append(f"- questions_per_concurrency: `base={args.questions_per_concurrency_base}`")
