@@ -198,6 +198,7 @@ PROFILE_STAGE=ncu \
 ```
 
 `scripts/profile_sglang_server.sh` 现在支持 `PROFILE_STAGE=nsys|ncu|both`，默认 `both`。脚本会保持 server/client 分离、优雅停止 profiled server 以保证报告落盘，并在 `ncu` 中使用 kernel-name 过滤（不依赖旧的 Python NVTX 名称）。
+如需关闭 CUDA Graph，可在运行脚本时加 `DISABLE_CUDA_GRAPH=1`（会向 server 追加 `--disable-cuda-graph`）。
 
 <div align="center">
   <img src="assets/dflash_results.png" width="100%">
