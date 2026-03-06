@@ -141,6 +141,52 @@ python benchmark_sglang.py \
 
 `benchmark_sglang.py` supports baseline + DFLASH + EAGLE runs, and reports DFLASH/EAGLE speedup in markdown output. You can tune DFLASH/EAGLE depth via `--dflash-block-size` and `--eagle-num-steps` / `--eagle-num-draft-tokens`; `--eagle-topk` defaults to `1`.
 
+### Profiling SGLang server correctly (nsys + ncu)
+
+When profiling SGLang, treat `benchmark_sglang.py` as a load generator and profile the serving process itself. The client script now supports `--server-url` mode so you can run against an existing server without auto-spawn/auto-kill.
+
+1) Start SGLang server independently (example: DFLASH):
+
+```bash
+python -m sglang.launch_server \
+  --model-path Qwen/Qwen3-8B \
+  --speculative-algorithm DFLASH \
+  --speculative-draft-model-path z-lab/Qwen3-8B-DFlash-b16 \
+  --host 127.0.0.1 \
+  --port 31000 \
+  --trust-remote-code \
+  --attention-backend flashinfer \
+  --tp-size 1 \
+  --dtype bfloat16
+```
+
+2) Use fixed concurrencies as load (`1,8,32`) from benchmark client mode:
+
+```bash
+python benchmark_sglang.py \
+  --dataset-name math500 \
+  --target-model Qwen/Qwen3-8B \
+  --concurrencies 1,8,32 \
+  --questions-per-concurrency-base 64 \
+  --max-questions-per-config 512 \
+  --server-url http://127.0.0.1:31000 \
+  --server-label dflash \
+  --server-expect-speculative \
+  --output-md profiles/sglang_client.md
+```
+
+3) System-level timeline first (`nsys`), then hotspot deep-dive (`ncu`):
+
+```bash
+TARGET_MODEL=Qwen/Qwen3-8B \
+DRAFT_MODEL=z-lab/Qwen3-8B-DFlash-b16 \
+SERVER_MODE=dflash \
+CONCURRENCIES=1,8,32 \
+./scripts/profile_sglang_server.sh
+```
+
+The helper script keeps server/client separated, gracefully stops the profiled server for report flush, and uses kernel-name filtering for `ncu` (no dependence on legacy Python NVTX tags).
+
 <div align="center">
   <img src="assets/dflash_results.png" width="100%">
 </div>
