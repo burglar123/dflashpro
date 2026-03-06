@@ -141,6 +141,64 @@ python benchmark_sglang.py \
 
 `benchmark_sglang.py` supports baseline + DFLASH + EAGLE runs, and reports DFLASH/EAGLE speedup in markdown output. You can tune DFLASH/EAGLE depth via `--dflash-block-size` and `--eagle-num-steps` / `--eagle-num-draft-tokens`; `--eagle-topk` defaults to `1`.
 
+### Profiling SGLang server correctly (nsys + ncu)
+
+When profiling SGLang, treat `benchmark_sglang.py` as a load generator and profile the serving process itself. The client script now supports `--server-url` mode so you can run against an existing server without auto-spawn/auto-kill.
+
+1) Start SGLang server independently (example: DFLASH):
+
+```bash
+python -m sglang.launch_server \
+  --model-path Qwen/Qwen3-8B \
+  --speculative-algorithm DFLASH \
+  --speculative-draft-model-path z-lab/Qwen3-8B-DFlash-b16 \
+  --host 127.0.0.1 \
+  --port 31000 \
+  --trust-remote-code \
+  --attention-backend flashinfer \
+  --tp-size 1 \
+  --dtype bfloat16
+```
+
+2) Use fixed concurrencies as load (`1,8,32`) from benchmark client mode:
+
+```bash
+python benchmark_sglang.py \
+  --dataset-name math500 \
+  --target-model Qwen/Qwen3-8B \
+  --concurrencies 1,8,32 \
+  --questions-per-concurrency-base 64 \
+  --max-questions-per-config 512 \
+  --server-url http://127.0.0.1:31000 \
+  --server-label dflash \
+  --server-expect-speculative \
+  --output-md profiles/sglang_client.md
+```
+
+3) System-level timeline first (`nsys`)；`ncu` 可单独再跑（更慢）：
+
+```bash
+TARGET_MODEL=Qwen/Qwen3-8B \
+DRAFT_MODEL=z-lab/Qwen3-8B-DFlash-b16 \
+SERVER_MODE=dflash \
+CONCURRENCIES=1,8,32 \
+PROFILE_STAGE=nsys \
+./scripts/profile_sglang_server.sh
+```
+
+4) 如果确认了热点，再单独跑 `ncu`：
+
+```bash
+TARGET_MODEL=Qwen/Qwen3-8B \
+DRAFT_MODEL=z-lab/Qwen3-8B-DFlash-b16 \
+SERVER_MODE=dflash \
+CONCURRENCIES=1,8,32 \
+PROFILE_STAGE=ncu \
+./scripts/profile_sglang_server.sh
+```
+
+`scripts/profile_sglang_server.sh` 现在支持 `PROFILE_STAGE=nsys|ncu|both`，默认 `both`。脚本会保持 server/client 分离、优雅停止 profiled server 以保证报告落盘，并在 `ncu` 中使用 kernel-name 过滤（不依赖旧的 Python NVTX 名称）。
+
 <div align="center">
   <img src="assets/dflash_results.png" width="100%">
 </div>
