@@ -130,6 +130,10 @@ class BlockManager:
         self._free_block_ids: list[int] = []
         self._block_refcount: dict[int, int] = {}
         self._prefix_hash_to_block: dict[str, int] = {}
+        self._seq_registry: dict[int, "Sequence"] = {}
+
+    def register_sequence(self, sequence: "Sequence") -> None:
+        self._seq_registry[sequence.seq_id] = sequence
 
     @staticmethod
     def hash_tokens(token_ids: list[int], logical_start: int) -> str:
@@ -175,12 +179,21 @@ class BlockManager:
         self.retain(block_id)
         return block_id, content_hash, cache_hit
 
-    def rollback_sequence(self, sequence: "Sequence", new_num_cached_tokens: int) -> None:
-        if new_num_cached_tokens > sequence.num_cached_tokens:
+    def rollback(self, seq_id: int, rollback_to: int) -> None:
+        sequence = self._seq_registry.get(seq_id)
+        if sequence is None:
+            raise ValueError(f"unknown seq_id={seq_id}")
+        if rollback_to > sequence.num_cached_tokens:
             raise ValueError("rollback target cannot exceed current num_cached_tokens")
-        while sequence.block_table and sequence.block_table[-1].logical_start >= new_num_cached_tokens:
+        while sequence.block_table and sequence.block_table[-1].logical_start >= rollback_to:
             removed = sequence.block_table.pop()
             self.release(removed.physical_block_id)
+        sequence.num_cached_tokens = rollback_to
+        sync_sequence_blocks(sequence, self)
+
+    def rollback_sequence(self, sequence: "Sequence", new_num_cached_tokens: int) -> None:
+        self.register_sequence(sequence)
+        self.rollback(sequence.seq_id, new_num_cached_tokens)
 
     def check_consistency(self, sequence: "Sequence") -> None:
         mapped_tokens = sum(mapping.logical_end - mapping.logical_start for mapping in sequence.block_table)
@@ -243,10 +256,13 @@ class Sequence:
 
 
 class Scheduler:
-    def __init__(self, sequences: list[Sequence]):
+    def __init__(self, sequences: list[Sequence], block_manager: BlockManager | None = None):
         self.waiting: list[Sequence] = list(sequences)
         self.running: list[Sequence] = []
         self.finished: list[Sequence] = []
+        self._seq_registry: dict[int, Sequence] = {seq.seq_id: seq for seq in sequences}
+        self.block_manager = block_manager
+        self._draft_transactions: dict[int, dict[str, int | list[int]]] = {}
 
     def has_pending(self) -> bool:
         return len(self.waiting) > 0 or len(self.running) > 0
@@ -282,6 +298,40 @@ class Scheduler:
         seq.finished = True
         self.running = [running_seq for running_seq in self.running if running_seq.seq_id != seq.seq_id]
         self.finished.append(seq)
+
+    def append_draft_tokens(self, seq_id: int, draft_tokens: list[int]) -> None:
+        if self.block_manager is None:
+            raise ValueError("block_manager is required for draft transactions")
+        seq = self._seq_registry[seq_id]
+        draft_start = seq.num_cached_tokens
+        seq.token_ids = seq.token_ids[:draft_start] + draft_tokens
+        seq.num_cached_tokens = draft_start + len(draft_tokens)
+        sync_sequence_blocks(seq, self.block_manager)
+        occupied_blocks = [
+            mapping.physical_block_id
+            for mapping in seq.block_table
+            if mapping.logical_start >= draft_start
+        ]
+        self._draft_transactions[seq_id] = {
+            "start": draft_start,
+            "num_tokens": len(draft_tokens),
+            "num_blocks": len(occupied_blocks),
+        }
+
+    def consume_draft_transaction(self, seq_id: int) -> dict[str, int | list[int]]:
+        txn = self._draft_transactions.pop(seq_id, None)
+        if txn is None:
+            raise ValueError(f"no draft transaction for seq_id={seq_id}")
+        return txn
+
+    def rollback(self, seq_id: int, rollback_to: int) -> None:
+        if self.block_manager is None:
+            raise ValueError("block_manager is required for rollback")
+        seq = self._seq_registry.get(seq_id)
+        if seq is None:
+            raise ValueError(f"unknown seq_id={seq_id}")
+        seq.token_ids = seq.token_ids[:rollback_to]
+        self.block_manager.rollback(seq_id, rollback_to)
 
 
 @dataclass
@@ -810,8 +860,9 @@ def dflash_generate_batch_staged(
         for row in range(state.output_ids.shape[0])
     ]
     for sequence in sequences:
+        block_manager.register_sequence(sequence)
         sync_sequence_blocks(sequence, block_manager)
-    scheduler = Scheduler(sequences)
+    scheduler = Scheduler(sequences, block_manager=block_manager)
     stop_tokens = (
         torch.tensor(stop_token_ids, device=state.output_ids.device) if stop_token_ids is not None else None
     )
@@ -838,12 +889,8 @@ def dflash_generate_batch_staged(
             block_size=block_size,
         )
 
-        staged_old_state: dict[int, tuple[int, list[int]]] = {}
         for local_row, seq in enumerate(scheduled_batch):
-            staged_old_state[seq.seq_id] = (seq.num_cached_tokens, list(seq.token_ids))
-            seq.token_ids = seq.token_ids[: seq.num_cached_tokens] + block_output_ids[local_row].tolist()
-            seq.num_cached_tokens = staged_old_state[seq.seq_id][0] + block_size
-            sync_sequence_blocks(seq, block_manager)
+            scheduler.append_draft_tokens(seq.seq_id, block_output_ids[local_row].tolist())
 
         posterior, acceptance_len_vec, target_hidden, active_target_cache = target_verify_step(
             model=model,
@@ -870,15 +917,18 @@ def dflash_generate_batch_staged(
         for local_row, row in enumerate(active_indices.tolist()):
             seq = sequences[row]
             seq.pre_verify = False
-            seq.num_acc_tokens += int(acceptance_len_vec[local_row].item()) + 1
-            prev_cached_tokens, prev_token_ids = staged_old_state[row]
             accepted_len = int(acceptance_len_vec[local_row].item()) + 1
+            seq.num_acc_tokens += accepted_len
+
+            txn = scheduler.consume_draft_transaction(seq.seq_id)
+            draft_start = int(txn["start"])
             accepted_tokens = block_output_ids[local_row, :accepted_len].tolist()
             verify_token = int(posterior[local_row, accepted_len - 1].item())
-            seq.token_ids = prev_token_ids[:prev_cached_tokens] + accepted_tokens + [verify_token]
             seq.pending_kv_append.extend(accepted_tokens + [verify_token])
-            seq.num_cached_tokens = int(state.start_pos[row].item())
-            block_manager.rollback_sequence(seq, seq.num_cached_tokens)
+
+            scheduler.rollback(seq.seq_id, draft_start + accepted_len)
+            seq.token_ids = seq.token_ids[: seq.num_cached_tokens] + [verify_token]
+            seq.num_cached_tokens += 1
             sync_sequence_blocks(seq, block_manager)
 
             row_input_length = int(state.input_lengths[row].item())
