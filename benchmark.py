@@ -653,29 +653,46 @@ def target_verify_step(
     if len(verify_lens) != active_batch:
         raise ValueError("verify_lens and active batch size mismatch")
 
+    packed_ranges = packed_meta["packed_ranges"]
+    slot_mapping = packed_meta["slot_mapping"]
+    context_lens = packed_meta["context_lens"]
+    block_tables = packed_meta["block_tables"]
+    assert isinstance(packed_ranges, list)
+    assert isinstance(slot_mapping, list)
+    assert isinstance(context_lens, list)
+    assert isinstance(block_tables, list)
+
+    packed_tokens = torch.cat(
+        [block_output_ids[local_row, :verify_len] for local_row, verify_len in enumerate(verify_lens)],
+        dim=0,
+    )
+    packed_positions = torch.cat(
+        [block_position_ids[local_row, :verify_len] for local_row, verify_len in enumerate(verify_lens)],
+        dim=0,
+    )
+    packed_input_ids = packed_tokens.unsqueeze(0)
+    packed_position_ids = packed_positions.unsqueeze(0)
+
     with profile_phase("target.verify"):
         with nvtx_range("target.verify.forward"):
             output = target(
-                block_output_ids,
-                position_ids=block_position_ids,
+                packed_input_ids,
+                position_ids=packed_position_ids,
                 past_key_values=active_target_cache,
                 use_cache=True,
                 output_hidden_states=True if block_size > 1 else False,
+                slot_mapping=slot_mapping,
+                context_lens=context_lens,
+                block_tables=block_tables,
             )
 
-    packed_logits: list[torch.Tensor] = []
-    for local_row, verify_len in enumerate(verify_lens):
-        packed_logits.append(output.logits[local_row, :verify_len, :])
-    packed_logits_tensor = torch.cat(packed_logits, dim=0) if packed_logits else output.logits.new_empty((0, output.logits.shape[-1]))
-
+    packed_logits_tensor = output.logits[0]
     target_logits = torch.full(
         (active_batch, block_size, output.logits.shape[-1]),
         -torch.inf,
         dtype=output.logits.dtype,
         device=output.logits.device,
     )
-    packed_ranges = packed_meta["packed_ranges"]
-    assert isinstance(packed_ranges, list)
     for local_row, (packed_start, packed_end) in enumerate(packed_ranges):
         local_len = packed_end - packed_start
         target_logits[local_row, :local_len, :] = packed_logits_tensor[packed_start:packed_end, :]
@@ -700,7 +717,15 @@ def target_verify_step(
 
     target_hidden = None
     if block_size > 1:
-        target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)
+        packed_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)
+        target_hidden = torch.zeros(
+            (active_batch, block_size, packed_hidden.shape[-1]),
+            dtype=packed_hidden.dtype,
+            device=packed_hidden.device,
+        )
+        for local_row, (packed_start, packed_end) in enumerate(packed_ranges):
+            local_len = packed_end - packed_start
+            target_hidden[local_row, :local_len, :] = packed_hidden[0, packed_start:packed_end, :]
         assert target_hidden.ndim == 3 and target_hidden.shape[0] == block_output_ids.shape[0]
 
     return posterior, acceptance_len_vec, target_hidden, active_target_cache
