@@ -537,8 +537,14 @@ def init_batch_state(
 
     target_hidden = None
     if block_size > 1:
-        target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)
-        assert target_hidden.ndim == 3 and target_hidden.shape[0] == batch_size
+        prefill_target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)
+        assert prefill_target_hidden.ndim == 3 and prefill_target_hidden.shape[0] == batch_size
+        target_hidden = torch.zeros(
+            (batch_size, output_ids.shape[1], prefill_target_hidden.shape[-1]),
+            dtype=prefill_target_hidden.dtype,
+            device=prefill_target_hidden.device,
+        )
+        target_hidden[:, : prefill_target_hidden.shape[1], :] = prefill_target_hidden
 
     state = BatchDecodeState(
         output_ids=output_ids,
@@ -740,7 +746,12 @@ def apply_acceptance_step(
             raise ValueError("target_hidden must be initialized when block_size > 1")
         for local_row, row in enumerate(active_indices.tolist()):
             acceptance_len = int(acceptance_len_vec[local_row].item())
-            state.target_hidden[row] = target_hidden[local_row, : acceptance_len + 1, :]
+            row_start_pos = int(active_start_pos[local_row].item())
+            row_end_pos = row_start_pos + acceptance_len + 1
+            target_hidden_slice = target_hidden[local_row, : acceptance_len + 1, :]
+            state_hidden_slice = state.target_hidden[row, row_start_pos:row_end_pos, :]
+            assert target_hidden_slice.shape == state_hidden_slice.shape
+            state.target_hidden[row, row_start_pos:row_end_pos, :] = target_hidden_slice
 
 
 

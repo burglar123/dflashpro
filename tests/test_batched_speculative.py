@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 from transformers import DynamicCache
 
@@ -23,6 +24,17 @@ class DummyDraftModel:
         self.device = device
         self.mask_token_id = -1
         self.target_layer_ids = [0]
+
+    def __call__(
+        self,
+        target_hidden: torch.Tensor,
+        noise_embedding: torch.Tensor,
+        position_ids: torch.Tensor,
+        past_key_values=None,
+        use_cache=True,
+        is_causal=False,
+    ) -> torch.Tensor:
+        return noise_embedding
 
 
 class DummyTargetModel:
@@ -438,3 +450,114 @@ def test_eos_hit_removes_sequence_from_running_and_releases_recyclable_blocks():
     assert seq0 not in scheduler.running
     assert seq0 in scheduler.finished
     assert free_after >= free_before + 2
+
+
+@pytest.mark.parametrize(
+    "block_size,acceptance_len",
+    [
+        (2, 0),
+        (2, 1),
+        (4, 0),
+        (4, 2),
+        (4, 3),
+    ],
+)
+def test_stage_c_acceptance_updates_target_hidden_slice_e2e(monkeypatch, block_size: int, acceptance_len: int):
+    import benchmark as benchmark_module
+
+    model = DummyDraftModel(device=torch.device("cpu"))
+    target = DummyTargetModel(vocab_size=256)
+    prompt = torch.tensor([[10, 11, 12]], dtype=torch.long)
+
+    original_target_verify_step = benchmark_module.target_verify_step
+    original_apply_acceptance_step = benchmark_module.apply_acceptance_step
+    apply_calls = []
+
+    def fake_target_verify_step(
+        model,
+        target,
+        state,
+        scheduled_batch,
+        active_indices,
+        block_output_ids,
+        block_position_ids,
+        block_size,
+        temperature,
+    ):
+        active_batch = int(active_indices.numel())
+        posterior = torch.full((active_batch, block_size), 77, dtype=torch.long, device=state.output_ids.device)
+        acceptance_len_vec = torch.full(
+            (active_batch,),
+            acceptance_len,
+            dtype=torch.long,
+            device=state.output_ids.device,
+        )
+        hidden_dim = int(state.target_hidden.shape[-1])
+        target_hidden = torch.arange(
+            active_batch * block_size * hidden_dim,
+            dtype=state.target_hidden.dtype,
+            device=state.target_hidden.device,
+        ).reshape(active_batch, block_size, hidden_dim)
+        active_target_cache = benchmark_module.gather_active_rows(state.past_key_values_target, active_indices)
+        return posterior, acceptance_len_vec, target_hidden, active_target_cache
+
+    def wrapped_apply_acceptance_step(
+        state,
+        active_indices,
+        block_output_ids,
+        posterior,
+        acceptance_len_vec,
+        target_hidden,
+        active_target_cache,
+        block_size,
+    ):
+        assert target_hidden is not None
+        row = int(active_indices[0].item())
+        row_start_pos = int(state.start_pos[row].item())
+        local_acceptance_len = int(acceptance_len_vec[0].item())
+        row_end_pos = row_start_pos + local_acceptance_len + 1
+        before_row = state.target_hidden[row].clone()
+
+        original_apply_acceptance_step(
+            state=state,
+            active_indices=active_indices,
+            block_output_ids=block_output_ids,
+            posterior=posterior,
+            acceptance_len_vec=acceptance_len_vec,
+            target_hidden=target_hidden,
+            active_target_cache=active_target_cache,
+            block_size=block_size,
+        )
+
+        after_row = state.target_hidden[row]
+        assert torch.equal(after_row[:row_start_pos], before_row[:row_start_pos])
+        assert torch.equal(after_row[row_end_pos:], before_row[row_end_pos:])
+        assert torch.equal(
+            after_row[row_start_pos:row_end_pos],
+            target_hidden[0, : local_acceptance_len + 1, :],
+        )
+        apply_calls.append(local_acceptance_len)
+
+    monkeypatch.setattr(benchmark_module, "target_verify_step", fake_target_verify_step)
+    monkeypatch.setattr(benchmark_module, "apply_acceptance_step", wrapped_apply_acceptance_step)
+
+    with torch.inference_mode():
+        responses = benchmark_module.dflash_generate_batch(
+            model=model,
+            target=target,
+            input_ids=prompt,
+            attention_mask=torch.ones_like(prompt),
+            input_lengths=torch.tensor([prompt.shape[1]], dtype=torch.long),
+            mask_token_id=model.mask_token_id,
+            max_new_tokens=1,
+            block_size=block_size,
+            stop_token_ids=None,
+            temperature=0.0,
+            batched_decode_mode="stage_c_full_speculative",
+        )
+
+    assert len(responses) == 1
+    assert apply_calls == [acceptance_len]
+
+    monkeypatch.setattr(benchmark_module, "target_verify_step", original_target_verify_step)
+    monkeypatch.setattr(benchmark_module, "apply_acceptance_step", original_apply_acceptance_step)
