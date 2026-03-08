@@ -141,6 +141,15 @@ python benchmark_sglang.py \
 
 `benchmark_sglang.py` supports baseline + DFLASH + EAGLE runs, and reports DFLASH/EAGLE speedup in markdown output. You can tune DFLASH/EAGLE depth via `--dflash-block-size` and `--eagle-num-steps` / `--eagle-num-draft-tokens`; `--eagle-topk` defaults to `1`.
 
+### Benchmark comparison protocol
+
+- **Throughput (`tokens/s`)** is reported as total generated tokens divided by total decode time across requests. This is the primary metric for batch scaling.
+- **Per-request latency** is reported with **TTFT** (time-to-first-token) and **TPOT** (time-per-output-token) percentiles (`p50/p90/p99`).
+- `benchmark.py` also logs:
+  - active batch size trace across decode steps,
+  - average acceptance length + acceptance histogram.
+- Performance gate: when using `block_size >= 4`, throughput speedup must exceed `--throughput-min-speedup` (default `1.2`) versus the `block_size=1` baseline on the same run.
+
 ### Profiling SGLang server correctly (nsys + ncu)
 
 When profiling SGLang, treat `benchmark_sglang.py` as a load generator and profile the serving process itself. The client script now supports `--server-url` mode so you can run against an existing server without auto-spawn/auto-kill.
