@@ -638,3 +638,96 @@ def test_target_verify_step_uses_packed_verify_lengths_for_pre_verify_rows():
     assert target.last_slot_mapping == [0, 1, 1, 1, 1]
     assert target.last_context_lens == [3, 3]
     assert target.last_block_tables == [[], []]
+
+
+@pytest.mark.parametrize(
+    "scenario,acceptance_len,verify_token,stop_tokens,expect_stop",
+    [
+        ("all_reject", 0, 150, [255], False),
+        ("mid_reject", 1, 151, [255], False),
+        ("all_accept", 2, 152, [255], False),
+        ("all_accept_with_eos", 2, 199, [199], True),
+    ],
+)
+def test_stage_c_rollback_paths_are_stable_with_acceptance_and_eos(
+    monkeypatch,
+    scenario: str,
+    acceptance_len: int,
+    verify_token: int,
+    stop_tokens: list[int],
+    expect_stop: bool,
+):
+    import benchmark as benchmark_module
+
+    model = DummyDraftModel(device=torch.device("cpu"))
+    target = DummyTargetModel(vocab_size=256)
+    prompt = torch.tensor([[10, 11, 12]], dtype=torch.long)
+
+    original_target_verify_step = benchmark_module.target_verify_step
+
+    def scripted_target_verify_step(
+        model,
+        target,
+        state,
+        scheduled_batch,
+        active_indices,
+        block_output_ids,
+        block_position_ids,
+        block_size,
+        temperature,
+    ):
+        active_batch = int(active_indices.numel())
+        posterior = torch.full(
+            (active_batch, block_size),
+            verify_token,
+            dtype=torch.long,
+            device=state.output_ids.device,
+        )
+        acceptance_len_vec = torch.full(
+            (active_batch,),
+            acceptance_len,
+            dtype=torch.long,
+            device=state.output_ids.device,
+        )
+        active_target_cache = benchmark_module.gather_active_rows(state.past_key_values_target, active_indices)
+        hidden_dim = int(state.target_hidden.shape[-1])
+        target_hidden = torch.zeros(
+            (active_batch, block_size, hidden_dim),
+            dtype=state.target_hidden.dtype,
+            device=state.target_hidden.device,
+        )
+        return posterior, acceptance_len_vec, target_hidden, active_target_cache
+
+    monkeypatch.setattr(benchmark_module, "target_verify_step", scripted_target_verify_step)
+
+    with torch.inference_mode():
+        first = benchmark_module.dflash_generate_batch(
+            model=model,
+            target=target,
+            input_ids=prompt,
+            attention_mask=torch.ones_like(prompt),
+            input_lengths=torch.tensor([prompt.shape[1]], dtype=torch.long),
+            mask_token_id=model.mask_token_id,
+            max_new_tokens=1,
+            block_size=3,
+            stop_token_ids=stop_tokens,
+            temperature=0.0,
+            batched_decode_mode="stage_c_full_speculative",
+        )[0].output_ids[0]
+        second = benchmark_module.dflash_generate_batch(
+            model=model,
+            target=target,
+            input_ids=prompt,
+            attention_mask=torch.ones_like(prompt),
+            input_lengths=torch.tensor([prompt.shape[1]], dtype=torch.long),
+            mask_token_id=model.mask_token_id,
+            max_new_tokens=1,
+            block_size=3,
+            stop_token_ids=stop_tokens,
+            temperature=0.0,
+            batched_decode_mode="stage_c_full_speculative",
+        )[0].output_ids[0]
+
+    assert torch.equal(first, second), f"scenario {scenario} output drifted after rollback"
+    if expect_stop:
+        assert verify_token in first.tolist()
