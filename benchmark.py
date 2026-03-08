@@ -428,17 +428,23 @@ def finalize_outputs(
 ) -> list[SimpleNamespace]:
     assert state.output_ids.ndim == 2
     responses: list[SimpleNamespace] = []
-    output_ids = state.output_ids[:, : state.max_length]
-    for row in range(output_ids.shape[0]):
-        row_output = output_ids[row : row + 1, output_ids[row] != mask_token_id]
+    stop_tokens = None
+    if stop_token_ids is not None:
+        stop_tokens = torch.tensor(stop_token_ids, device=state.output_ids.device)
+
+    for row in range(state.output_ids.shape[0]):
+        row_full_output = state.output_ids[row]
+        row_output = row_full_output[row_full_output != mask_token_id]
         num_input_tokens = int(state.input_lengths[row].item())
-        if stop_token_ids is not None:
-            stop_tokens = torch.tensor(stop_token_ids, device=row_output.device)
-            stop_token_indices = torch.isin(
-                row_output[0][num_input_tokens:], stop_tokens
-            ).nonzero(as_tuple=True)[0]
+
+        if stop_tokens is not None and row_output.numel() > num_input_tokens:
+            stop_token_indices = torch.isin(row_output[num_input_tokens:], stop_tokens).nonzero(
+                as_tuple=True
+            )[0]
             if stop_token_indices.numel() > 0:
-                row_output = row_output[:, : num_input_tokens + stop_token_indices[0] + 1]
+                row_output = row_output[: num_input_tokens + int(stop_token_indices[0].item()) + 1]
+
+        row_output = row_output.unsqueeze(0)
 
         num_output_tokens = row_output.shape[1] - num_input_tokens
         total_decode_time = cuda_time() - state.decode_start
@@ -467,11 +473,13 @@ def dflash_generate(
     block_size: int,
     stop_token_ids: list[int],
     temperature: float = 0.0,
-) -> SimpleNamespace:
-    assert input_ids.ndim == 2 and input_ids.shape[0] == 1, "dflash_generate compatibility path expects B=1"
+) -> list[SimpleNamespace]:
+    assert input_ids.ndim == 2, "input_ids must be [B, S]"
     attention_mask = torch.ones_like(input_ids, dtype=torch.long)
-    input_lengths = torch.tensor([input_ids.shape[1]], device=input_ids.device, dtype=torch.long)
-    responses = dflash_generate_batch_staged(
+    input_lengths = torch.full(
+        (input_ids.shape[0],), input_ids.shape[1], device=input_ids.device, dtype=torch.long
+    )
+    return dflash_generate_batch_staged(
         model=model,
         target=target,
         input_ids=input_ids,
@@ -483,7 +491,6 @@ def dflash_generate(
         stop_token_ids=stop_token_ids,
         temperature=temperature,
     )
-    return responses[0]
 
 
 def dflash_generate_batch_staged(
@@ -511,12 +518,22 @@ def dflash_generate_batch_staged(
     )
 
     while True:
-        state.finished_mask = state.start_pos >= state.max_length
+        reached_max_new_tokens = (state.start_pos - state.input_lengths) >= max_new_tokens
+        no_available_position = state.start_pos >= state.output_ids.shape[1] - 1
+
+        hit_stop_token = torch.zeros_like(state.finished_mask)
         if stop_token_ids is not None:
             stop_tokens = torch.tensor(stop_token_ids, device=state.output_ids.device)
-            last_positions = torch.clamp(state.start_pos - 1, min=0)
-            last_tokens = state.output_ids[torch.arange(state.output_ids.shape[0], device=state.output_ids.device), last_positions]
-            state.finished_mask |= torch.isin(last_tokens, stop_tokens)
+            for row in range(state.output_ids.shape[0]):
+                row_start = int(state.input_lengths[row].item())
+                row_end = int(state.start_pos[row].item()) + 1
+                row_tokens = state.output_ids[row, row_start:row_end]
+                if row_tokens.numel() == 0:
+                    continue
+                if torch.isin(row_tokens, stop_tokens).any():
+                    hit_stop_token[row] = True
+
+        state.finished_mask = hit_stop_token | reached_max_new_tokens | no_available_position
 
         state.active_indices = (~state.finished_mask).nonzero(as_tuple=True)[0]
         if state.active_indices.numel() == 0:
