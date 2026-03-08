@@ -4,10 +4,13 @@ import torch
 from transformers import DynamicCache
 
 from benchmark import (
+    BlockManager,
+    Sequence,
     dflash_generate,
     dflash_generate_batch,
     gather_active_rows,
     scatter_back_rows,
+    sync_sequence_blocks,
 )
 
 
@@ -204,3 +207,53 @@ def test_cache_alignment_after_active_row_compaction_and_scatter():
     assert torch.equal(full_cache.key_cache[0][3, :, 2:, :], torch.full((2, 2, 3), -7.0))
     assert torch.equal(full_cache.value_cache[0][1, :, 1:3, :], torch.full((2, 2, 3), -9.0))
     assert torch.equal(full_cache.value_cache[0][3, :, 1:3, :], torch.full((2, 2, 3), -9.0))
+
+
+def test_block_manager_prefix_cache_reuses_blocks_and_tracks_refcount():
+    manager = BlockManager(block_size=2)
+    seq_a = Sequence(
+        seq_id=0,
+        token_ids=[1, 2, 3, 4, 5],
+        num_cached_tokens=4,
+        block_table=[],
+        pre_verify=True,
+        num_acc_tokens=0,
+        finished=False,
+    )
+    seq_b = Sequence(
+        seq_id=1,
+        token_ids=[1, 2, 3, 9, 10],
+        num_cached_tokens=4,
+        block_table=[],
+        pre_verify=True,
+        num_acc_tokens=0,
+        finished=False,
+    )
+
+    sync_sequence_blocks(seq_a, manager)
+    sync_sequence_blocks(seq_b, manager)
+
+    assert seq_a.block_table[0].physical_block_id == seq_b.block_table[0].physical_block_id
+    assert seq_a.block_table[1].physical_block_id != seq_b.block_table[1].physical_block_id
+
+
+def test_block_manager_rollback_and_consistency():
+    manager = BlockManager(block_size=3)
+    seq = Sequence(
+        seq_id=0,
+        token_ids=[7, 8, 9, 10, 11, 12],
+        num_cached_tokens=6,
+        block_table=[],
+        pre_verify=False,
+        num_acc_tokens=0,
+        finished=False,
+    )
+
+    sync_sequence_blocks(seq, manager)
+    seq.num_cached_tokens = 4
+    manager.rollback_sequence(seq, seq.num_cached_tokens)
+    sync_sequence_blocks(seq, manager)
+
+    assert len(seq.block_table) == 2
+    assert seq.block_table[1].logical_start == 3
+    assert seq.block_table[1].logical_end == 4
