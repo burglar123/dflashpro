@@ -569,12 +569,14 @@ def test_target_verify_step_uses_packed_verify_lengths_for_pre_verify_rows():
         def __init__(self, vocab_size: int = 256):
             super().__init__(vocab_size=vocab_size)
             self.last_input_shape = None
+            self.last_attention_mask = None
             self.last_slot_mapping = None
             self.last_context_lens = None
             self.last_block_tables = None
 
         def __call__(self, input_ids: torch.Tensor, *args, **kwargs):
             self.last_input_shape = tuple(input_ids.shape)
+            self.last_attention_mask = kwargs.get("attention_mask")
             self.last_slot_mapping = kwargs.get("slot_mapping")
             self.last_context_lens = kwargs.get("context_lens")
             self.last_block_tables = kwargs.get("block_tables")
@@ -634,10 +636,77 @@ def test_target_verify_step_uses_packed_verify_lengths_for_pre_verify_rows():
         temperature=0.0,
     )
 
-    assert target.last_input_shape == (1, 5)
+    assert target.last_input_shape == (2, 4)
+    assert target.last_attention_mask is not None
+    assert target.last_attention_mask.tolist() == [[1, 0, 0, 0], [1, 1, 1, 1]]
     assert target.last_slot_mapping == [0, 1, 1, 1, 1]
     assert target.last_context_lens == [3, 3]
     assert target.last_block_tables == [[], []]
+
+
+def test_target_verify_step_validates_cache_batch_alignment_for_sequence_packed_inputs(monkeypatch):
+    import benchmark as benchmark_module
+
+    model = DummyDraftModel(device=torch.device("cpu"))
+    target = DummyTargetModel(vocab_size=256)
+
+    state, _ = init_batch_state(
+        model=model,
+        target=target,
+        input_ids=torch.tensor([[10, 11, 12], [20, 21, 22]], dtype=torch.long),
+        attention_mask=torch.ones((2, 3), dtype=torch.long),
+        input_lengths=torch.tensor([3, 3], dtype=torch.long),
+        mask_token_id=model.mask_token_id,
+        max_new_tokens=4,
+        block_size=4,
+        temperature=0.0,
+    )
+
+    scheduled_batch = [
+        Sequence(
+            seq_id=0,
+            token_ids=[10, 11, 12, 13],
+            num_cached_tokens=3,
+            block_table=[],
+            pre_verify=True,
+            num_acc_tokens=0,
+            finished=False,
+            pending_kv_append=[],
+        ),
+        Sequence(
+            seq_id=1,
+            token_ids=[20, 21, 22, 23],
+            num_cached_tokens=3,
+            block_table=[],
+            pre_verify=False,
+            num_acc_tokens=0,
+            finished=False,
+            pending_kv_append=[],
+        ),
+    ]
+
+    wrong_cache = DynamicCache()
+    wrong_cache.key_cache = [torch.zeros((1, 1, 3, 4), dtype=torch.float32)]
+    wrong_cache.value_cache = [torch.zeros((1, 1, 3, 4), dtype=torch.float32)]
+
+    monkeypatch.setattr(benchmark_module, "gather_active_rows", lambda cache, active_indices: wrong_cache)
+
+    active_indices = torch.tensor([0, 1], dtype=torch.long)
+    block_output_ids = torch.tensor([[13, 99, 99, 99], [23, 24, 25, 26]], dtype=torch.long)
+    block_position_ids = torch.tensor([[3, 4, 5, 6], [3, 4, 5, 6]], dtype=torch.long)
+
+    with pytest.raises(ValueError, match="target verify batch mismatch"):
+        benchmark_module.target_verify_step(
+            model=model,
+            target=target,
+            state=state,
+            scheduled_batch=scheduled_batch,
+            active_indices=active_indices,
+            block_output_ids=block_output_ids,
+            block_position_ids=block_position_ids,
+            block_size=4,
+            temperature=0.0,
+        )
 
 
 @pytest.mark.parametrize(
