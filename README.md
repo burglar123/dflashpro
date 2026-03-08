@@ -149,6 +149,11 @@ python benchmark_sglang.py \
   - active batch size trace across decode steps,
   - average acceptance length + acceptance histogram.
 - Performance gate: when using `block_size >= 4`, throughput speedup must exceed `--throughput-min-speedup` (default `1.2`) versus the `block_size=1` baseline on the same run.
+- Batched speculative rollout supports fast rollback via `--batched-decode-mode`:
+  - `stage_a_prefill_only`: batched prefill + per-row decode (validate packing/alignment),
+  - `stage_b_target_only`: active-row batched decode with speculative disabled,
+  - `stage_c_full_speculative`: full draft+verify+acceptance vectorization,
+  - `legacy`: fallback to per-row generation path.
 
 ### Profiling SGLang server correctly (nsys + ncu)
 
