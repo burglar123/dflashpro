@@ -239,6 +239,7 @@ class Sequence:
     pre_verify: bool
     num_acc_tokens: int
     finished: bool
+    pending_kv_append: list[int]
 
 
 class Scheduler:
@@ -398,6 +399,34 @@ def build_batch_cache_metadata(
         "block_tables": block_tables,
         "context_lens": context_lens,
         "slot_mapping": slot_mapping,
+    }
+
+
+def prepare_packed_verify_inputs(
+    sequences: list[Sequence],
+    gamma: int,
+) -> dict[str, list[int] | list[list[int]] | list[tuple[int, int]]]:
+    if gamma <= 0:
+        raise ValueError("gamma must be positive")
+
+    verify_lens = [1 if seq.pre_verify else gamma for seq in sequences]
+    packed_ranges: list[tuple[int, int]] = []
+    slot_mapping: list[int] = []
+    cursor = 0
+    for seq_idx, verify_len in enumerate(verify_lens):
+        packed_ranges.append((cursor, cursor + verify_len))
+        slot_mapping.extend([seq_idx] * verify_len)
+        cursor += verify_len
+
+    context_lens = [int(seq.num_cached_tokens) for seq in sequences]
+    block_tables = [[mapping.physical_block_id for mapping in seq.block_table] for seq in sequences]
+
+    return {
+        "verify_lens": verify_lens,
+        "packed_ranges": packed_ranges,
+        "slot_mapping": slot_mapping,
+        "context_lens": context_lens,
+        "block_tables": block_tables,
     }
 
 
@@ -562,6 +591,12 @@ def target_verify_step(
     active_target_cache = gather_active_rows(state.past_key_values_target, active_indices)
     validate_cache_batch_size(active_target_cache, active_batch, "past_key_values_target")
 
+    packed_meta = prepare_packed_verify_inputs(scheduled_batch, gamma=block_size)
+    verify_lens = packed_meta["verify_lens"]
+    assert isinstance(verify_lens, list)
+    if len(verify_lens) != active_batch:
+        raise ValueError("verify_lens and active batch size mismatch")
+
     with profile_phase("target.verify"):
         with nvtx_range("target.verify.forward"):
             output = target(
@@ -572,9 +607,39 @@ def target_verify_step(
                 output_hidden_states=True if block_size > 1 else False,
             )
 
-    posterior = sample(output.logits, temperature)
+    packed_logits: list[torch.Tensor] = []
+    for local_row, verify_len in enumerate(verify_lens):
+        packed_logits.append(output.logits[local_row, :verify_len, :])
+    packed_logits_tensor = torch.cat(packed_logits, dim=0) if packed_logits else output.logits.new_empty((0, output.logits.shape[-1]))
+
+    target_logits = torch.full(
+        (active_batch, block_size, output.logits.shape[-1]),
+        -torch.inf,
+        dtype=output.logits.dtype,
+        device=output.logits.device,
+    )
+    packed_ranges = packed_meta["packed_ranges"]
+    assert isinstance(packed_ranges, list)
+    for local_row, (packed_start, packed_end) in enumerate(packed_ranges):
+        local_len = packed_end - packed_start
+        target_logits[local_row, :local_len, :] = packed_logits_tensor[packed_start:packed_end, :]
+
+    posterior = sample(target_logits, temperature)
     assert posterior.ndim == 2 and posterior.shape[0] == block_output_ids.shape[0]
-    acceptance_len_vec = (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)
+
+    max_cmp = block_size - 1
+    if max_cmp == 0:
+        acceptance_len_vec = torch.zeros((active_batch,), dtype=torch.long, device=block_output_ids.device)
+    else:
+        compare_positions = torch.arange(max_cmp, device=block_output_ids.device).unsqueeze(0)
+        valid_compare = compare_positions < (torch.tensor(verify_lens, device=block_output_ids.device).unsqueeze(1) - 1)
+        mismatches = (block_output_ids[:, 1 : 1 + max_cmp] != posterior[:, :max_cmp]) & valid_compare
+        first_mismatch = torch.where(
+            mismatches.any(dim=1),
+            mismatches.float().argmax(dim=1),
+            torch.full((active_batch,), -1, dtype=torch.long, device=block_output_ids.device),
+        )
+        acceptance_len_vec = torch.where(first_mismatch >= 0, first_mismatch, valid_compare.sum(dim=1))
     assert acceptance_len_vec.ndim == 1 and acceptance_len_vec.shape[0] == block_output_ids.shape[0]
 
     target_hidden = None
@@ -740,6 +805,7 @@ def dflash_generate_batch_staged(
             pre_verify=True,
             num_acc_tokens=0,
             finished=False,
+            pending_kv_append=[],
         )
         for row in range(state.output_ids.shape[0])
     ]
@@ -810,6 +876,7 @@ def dflash_generate_batch_staged(
             accepted_tokens = block_output_ids[local_row, :accepted_len].tolist()
             verify_token = int(posterior[local_row, accepted_len - 1].item())
             seq.token_ids = prev_token_ids[:prev_cached_tokens] + accepted_tokens + [verify_token]
+            seq.pending_kv_append.extend(accepted_tokens + [verify_token])
             seq.num_cached_tokens = int(state.start_pos[row].item())
             block_manager.rollback_sequence(seq, seq.num_cached_tokens)
             sync_sequence_blocks(seq, block_manager)

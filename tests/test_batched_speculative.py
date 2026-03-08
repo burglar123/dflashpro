@@ -9,8 +9,11 @@ from benchmark import (
     dflash_generate,
     dflash_generate_batch,
     gather_active_rows,
+    init_batch_state,
+    prepare_packed_verify_inputs,
     scatter_back_rows,
     sync_sequence_blocks,
+    target_verify_step,
 )
 
 
@@ -219,6 +222,7 @@ def test_block_manager_prefix_cache_reuses_blocks_and_tracks_refcount():
         pre_verify=True,
         num_acc_tokens=0,
         finished=False,
+        pending_kv_append=[],
     )
     seq_b = Sequence(
         seq_id=1,
@@ -228,6 +232,7 @@ def test_block_manager_prefix_cache_reuses_blocks_and_tracks_refcount():
         pre_verify=True,
         num_acc_tokens=0,
         finished=False,
+        pending_kv_append=[],
     )
 
     sync_sequence_blocks(seq_a, manager)
@@ -247,6 +252,7 @@ def test_block_manager_rollback_and_consistency():
         pre_verify=False,
         num_acc_tokens=0,
         finished=False,
+        pending_kv_append=[],
     )
 
     sync_sequence_blocks(seq, manager)
@@ -257,3 +263,92 @@ def test_block_manager_rollback_and_consistency():
     assert len(seq.block_table) == 2
     assert seq.block_table[1].logical_start == 3
     assert seq.block_table[1].logical_end == 4
+
+
+def test_prepare_packed_verify_inputs_respects_pre_verify_lengths():
+    seqs = [
+        Sequence(
+            seq_id=0,
+            token_ids=[1, 2, 3],
+            num_cached_tokens=2,
+            block_table=[],
+            pre_verify=True,
+            num_acc_tokens=0,
+            finished=False,
+            pending_kv_append=[],
+        ),
+        Sequence(
+            seq_id=1,
+            token_ids=[4, 5, 6, 7],
+            num_cached_tokens=3,
+            block_table=[],
+            pre_verify=False,
+            num_acc_tokens=0,
+            finished=False,
+            pending_kv_append=[],
+        ),
+    ]
+    packed = prepare_packed_verify_inputs(seqs, gamma=4)
+    assert packed["verify_lens"] == [1, 4]
+    assert packed["packed_ranges"] == [(0, 1), (1, 5)]
+    assert packed["slot_mapping"] == [0, 1, 1, 1, 1]
+
+
+def test_target_verify_step_handles_ragged_verify_lengths_without_misalignment():
+    model = DummyDraftModel(device=torch.device("cpu"))
+    target = DummyTargetModel(vocab_size=256)
+
+    state, _ = init_batch_state(
+        model=model,
+        target=target,
+        input_ids=torch.tensor([[10, 11, 12], [20, 21, 22]], dtype=torch.long),
+        attention_mask=torch.ones((2, 3), dtype=torch.long),
+        input_lengths=torch.tensor([3, 3], dtype=torch.long),
+        mask_token_id=model.mask_token_id,
+        max_new_tokens=4,
+        block_size=3,
+        temperature=0.0,
+    )
+
+    scheduled_batch = [
+        Sequence(
+            seq_id=0,
+            token_ids=[10, 11, 12, 13],
+            num_cached_tokens=3,
+            block_table=[],
+            pre_verify=True,
+            num_acc_tokens=0,
+            finished=False,
+            pending_kv_append=[],
+        ),
+        Sequence(
+            seq_id=1,
+            token_ids=[20, 21, 22, 23],
+            num_cached_tokens=3,
+            block_table=[],
+            pre_verify=False,
+            num_acc_tokens=0,
+            finished=False,
+            pending_kv_append=[],
+        ),
+    ]
+
+    active_indices = torch.tensor([0, 1], dtype=torch.long)
+    block_output_ids = torch.tensor([[13, 99, 99], [23, 24, 25]], dtype=torch.long)
+    block_position_ids = torch.tensor([[3, 4, 5], [3, 4, 5]], dtype=torch.long)
+
+    posterior, acceptance_len_vec, _, _ = target_verify_step(
+        model=model,
+        target=target,
+        state=state,
+        scheduled_batch=scheduled_batch,
+        active_indices=active_indices,
+        block_output_ids=block_output_ids,
+        block_position_ids=block_position_ids,
+        block_size=3,
+        temperature=0.0,
+    )
+
+    assert acceptance_len_vec.tolist() == [0, 2]
+    assert posterior[0, 0].item() == 14
+    assert posterior[1, 0].item() == 24
