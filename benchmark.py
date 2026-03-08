@@ -106,7 +106,8 @@ class ModuleRangeProfiler:
 
 
 def cuda_time() -> float:
-    torch.cuda.synchronize()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
     return time.perf_counter()
 
 
@@ -125,12 +126,15 @@ class BatchDecodeState:
     target_hidden: torch.Tensor | None
     decode_start: float
     draft_prefill: bool
+    active_batch_size_trace: list[int]
 
 
 def gather_active_rows(cache: DynamicCache, active_indices: torch.Tensor) -> DynamicCache:
     gathered_cache = DynamicCache()
-    gathered_cache.key_cache = [key.index_select(0, active_indices) for key in cache.key_cache]
-    gathered_cache.value_cache = [value.index_select(0, active_indices) for value in cache.value_cache]
+    key_cache = getattr(cache, "key_cache", [])
+    value_cache = getattr(cache, "value_cache", [])
+    gathered_cache.key_cache = [key.index_select(0, active_indices) for key in key_cache]
+    gathered_cache.value_cache = [value.index_select(0, active_indices) for value in value_cache]
     if hasattr(cache, "_seen_tokens"):
         gathered_cache._seen_tokens = cache._seen_tokens
     return gathered_cache
@@ -141,23 +145,28 @@ def scatter_back_rows(
     active_cache: DynamicCache,
     active_indices: torch.Tensor,
 ) -> None:
-    if len(full_cache.key_cache) != len(active_cache.key_cache):
+    full_key_cache = getattr(full_cache, "key_cache", [])
+    active_key_cache = getattr(active_cache, "key_cache", [])
+    full_value_cache = getattr(full_cache, "value_cache", [])
+    active_value_cache = getattr(active_cache, "value_cache", [])
+
+    if len(full_key_cache) != len(active_key_cache):
         raise ValueError("cache layer count mismatch while scattering active rows")
-    for layer_idx, (full_key, active_key) in enumerate(zip(full_cache.key_cache, active_cache.key_cache)):
+    for layer_idx, (full_key, active_key) in enumerate(zip(full_key_cache, active_key_cache)):
         if full_key.shape[0] <= int(active_indices.max().item()):
             raise ValueError(f"invalid active index for key cache layer {layer_idx}")
         full_key.index_copy_(0, active_indices, active_key)
-    for full_value, active_value in zip(full_cache.value_cache, active_cache.value_cache):
+    for full_value, active_value in zip(full_value_cache, active_value_cache):
         full_value.index_copy_(0, active_indices, active_value)
 
 
 def validate_cache_batch_size(cache: DynamicCache, expected_batch: int, cache_name: str) -> None:
-    for layer_idx, key in enumerate(cache.key_cache):
+    for layer_idx, key in enumerate(getattr(cache, "key_cache", [])):
         if key.shape[0] != expected_batch:
             raise ValueError(
                 f"{cache_name} layer {layer_idx} batch={key.shape[0]}, expected active batch={expected_batch}"
             )
-    for layer_idx, value in enumerate(cache.value_cache):
+    for layer_idx, value in enumerate(getattr(cache, "value_cache", [])):
         if value.shape[0] != expected_batch:
             raise ValueError(
                 f"{cache_name} layer {layer_idx} value batch={value.shape[0]}, expected active batch={expected_batch}"
@@ -272,6 +281,7 @@ def init_batch_state(
         target_hidden=target_hidden,
         decode_start=cuda_time(),
         draft_prefill=True,
+        active_batch_size_trace=[],
     )
     return state, state.decode_start - prefill_start
 
@@ -457,6 +467,7 @@ def finalize_outputs(
                 time_to_first_token=time_to_first_token,
                 time_per_output_token=time_per_output_token,
                 acceptance_lengths=state.acceptance_lengths_per_row[row],
+                active_batch_size_trace=state.active_batch_size_trace.copy(),
             )
         )
 
@@ -538,6 +549,7 @@ def dflash_generate_batch_staged(
         state.active_indices = (~state.finished_mask).nonzero(as_tuple=True)[0]
         if state.active_indices.numel() == 0:
             break
+        state.active_batch_size_trace.append(int(state.active_indices.numel()))
 
         block_output_ids, block_position_ids, active_indices = draft_propose_step(
             model=model,
@@ -600,6 +612,42 @@ def dflash_generate_batch(
     )
 
 
+def summarize_latency_percentiles(values: list[float]) -> dict[str, float]:
+    if not values:
+        return {"p50": float("nan"), "p90": float("nan"), "p99": float("nan")}
+    arr = np.asarray(values, dtype=np.float64)
+    return {
+        "p50": float(np.percentile(arr, 50)),
+        "p90": float(np.percentile(arr, 90)),
+        "p99": float(np.percentile(arr, 99)),
+    }
+
+
+def aggregate_active_batch_trace(responses: list[SimpleNamespace]) -> list[int]:
+    if not responses:
+        return []
+    max_steps = max(len(getattr(r, "active_batch_size_trace", [])) for r in responses)
+    if max_steps == 0:
+        return []
+    trace = []
+    for step in range(max_steps):
+        values = [
+            r.active_batch_size_trace[step]
+            for r in responses
+            if step < len(getattr(r, "active_batch_size_trace", []))
+        ]
+        trace.append(int(round(float(np.mean(values)))))
+    return trace
+
+
+def compute_throughput_tokens_per_second(responses: list[SimpleNamespace]) -> float:
+    total_tokens = sum(r.num_output_tokens for r in responses)
+    total_time = sum(r.time_per_output_token * max(r.num_output_tokens, 1) for r in responses)
+    if total_time <= 0:
+        return float("nan")
+    return float(total_tokens / total_time)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-name-or-path", type=str, required=True)
@@ -610,6 +658,7 @@ def main() -> None:
     parser.add_argument("--max-new-tokens", type=int, default=16384)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--throughput-min-speedup", type=float, default=1.2)
     args = parser.parse_args()
 
     if args.batch_size < 1:
@@ -774,19 +823,47 @@ def main() -> None:
             return
         responses = list(chain(*responses))
 
-    t1 = np.mean([r[1].time_per_output_token for r in responses])
-    tb = np.mean([r[block_size].time_per_output_token for r in responses])
+    baseline_responses = [r[1] for r in responses]
+    speculative_responses = [r[block_size] for r in responses]
+
+    t1 = np.mean([r.time_per_output_token for r in baseline_responses])
+    tb = np.mean([r.time_per_output_token for r in speculative_responses])
     print(f"Decoding speedup: {t1 / tb:.2f}")
 
-    tau = np.mean([np.mean(r[block_size].acceptance_lengths) for r in responses])
+    throughput_baseline = compute_throughput_tokens_per_second(baseline_responses)
+    throughput_spec = compute_throughput_tokens_per_second(speculative_responses)
+    throughput_speedup = throughput_spec / throughput_baseline
+    print(f"Throughput tokens/s baseline={throughput_baseline:.2f}, speculative={throughput_spec:.2f}, speedup={throughput_speedup:.2f}")
+    if block_size >= 4 and throughput_speedup < args.throughput_min_speedup:
+        raise RuntimeError(
+            f"Performance gate failed for block_size={block_size}: throughput speedup {throughput_speedup:.2f} < {args.throughput_min_speedup:.2f}"
+        )
+
+    acceptance_means = [np.mean(r.acceptance_lengths) for r in speculative_responses if r.acceptance_lengths]
+    tau = float(np.mean(acceptance_means)) if acceptance_means else float("nan")
     print(f"Average Acceptance length: {tau:.2f}")
 
-    acceptance_lengths = list(chain(*[r[block_size].acceptance_lengths for r in responses]))
+    acceptance_lengths = list(chain(*[r.acceptance_lengths for r in speculative_responses]))
     histogram = [
         acceptance_lengths.count(b) / len(acceptance_lengths)
         for b in range(block_size + 1)
-    ]
-    print(f"Acceptance length histogram: {[f'{x * 100:.1f}%' for x in histogram]}")
+    ] if acceptance_lengths else []
+    if histogram:
+        print(f"Acceptance length histogram: {[f'{x * 100:.1f}%' for x in histogram]}")
+
+    active_batch_trace = aggregate_active_batch_trace(speculative_responses)
+    print(f"Active batch size trace (mean by decode step): {active_batch_trace}")
+
+    ttft_percentiles = summarize_latency_percentiles([r.time_to_first_token for r in speculative_responses])
+    tpot_percentiles = summarize_latency_percentiles([r.time_per_output_token for r in speculative_responses])
+    print(
+        "TTFT percentiles (s): "
+        f"p50={ttft_percentiles['p50']:.4f}, p90={ttft_percentiles['p90']:.4f}, p99={ttft_percentiles['p99']:.4f}"
+    )
+    print(
+        "TPOT percentiles (s/token): "
+        f"p50={tpot_percentiles['p50']:.6f}, p90={tpot_percentiles['p90']:.6f}, p99={tpot_percentiles['p99']:.6f}"
+    )
 
 
 if __name__ == "__main__":
