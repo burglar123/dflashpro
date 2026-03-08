@@ -5,6 +5,7 @@ from transformers import DynamicCache
 
 from benchmark import (
     BlockManager,
+    Scheduler,
     Sequence,
     dflash_generate,
     dflash_generate_batch,
@@ -352,3 +353,88 @@ def test_target_verify_step_handles_ragged_verify_lengths_without_misalignment()
     assert acceptance_len_vec.tolist() == [0, 2]
     assert posterior[0, 0].item() == 14
     assert posterior[1, 0].item() == 24
+
+
+def _build_sequence(seq_id: int, token_ids: list[int], num_cached_tokens: int) -> Sequence:
+    return Sequence(
+        seq_id=seq_id,
+        token_ids=list(token_ids),
+        num_cached_tokens=num_cached_tokens,
+        block_table=[],
+        pre_verify=False,
+        num_acc_tokens=0,
+        finished=False,
+        pending_kv_append=[],
+    )
+
+
+def test_scheduler_and_block_manager_rollback_are_atomic():
+    manager = BlockManager(block_size=2)
+    seq = _build_sequence(seq_id=0, token_ids=[10, 11], num_cached_tokens=2)
+    manager.register_sequence(seq)
+    sync_sequence_blocks(seq, manager)
+
+    scheduler = Scheduler([seq], block_manager=manager)
+    scheduler.schedule_next_batch()
+    scheduler.append_draft_tokens(seq_id=0, draft_tokens=[12, 13, 14])
+
+    scheduler.rollback(seq_id=0, rollback_to=3)
+
+    assert seq.num_cached_tokens == 3
+    assert seq.token_ids == [10, 11, 12]
+    assert all(mapping.logical_start < 3 for mapping in seq.block_table)
+    manager.check_consistency(seq)
+
+
+def test_transactional_accept_reject_paths_cover_all_reject_mid_reject_all_accept():
+    scenarios = [
+        ("all_reject", 0, [20, 21, 99]),
+        ("mid_reject", 2, [20, 21, 30, 31, 99]),
+        ("all_accept", 4, [20, 21, 30, 31, 32, 33, 99]),
+    ]
+
+    for _, accepted_draft_len, expected_tokens in scenarios:
+        manager = BlockManager(block_size=2)
+        seq = _build_sequence(seq_id=0, token_ids=[20, 21], num_cached_tokens=2)
+        manager.register_sequence(seq)
+        sync_sequence_blocks(seq, manager)
+        scheduler = Scheduler([seq], block_manager=manager)
+        scheduler.schedule_next_batch()
+
+        draft_tokens = [30, 31, 32, 33]
+        scheduler.append_draft_tokens(seq_id=0, draft_tokens=draft_tokens)
+        txn = scheduler.consume_draft_transaction(seq_id=0)
+        draft_start = int(txn["start"])
+
+        scheduler.rollback(seq_id=0, rollback_to=draft_start + accepted_draft_len)
+        seq.token_ids = seq.token_ids[: seq.num_cached_tokens] + [99]
+        seq.num_cached_tokens += 1
+        sync_sequence_blocks(seq, manager)
+
+        assert seq.token_ids == expected_tokens
+        assert seq.num_cached_tokens == len(expected_tokens)
+        manager.check_consistency(seq)
+
+
+def test_eos_hit_removes_sequence_from_running_and_releases_recyclable_blocks():
+    manager = BlockManager(block_size=2)
+    seq0 = _build_sequence(seq_id=0, token_ids=[1, 2], num_cached_tokens=2)
+    seq1 = _build_sequence(seq_id=1, token_ids=[3, 4], num_cached_tokens=2)
+    for seq in (seq0, seq1):
+        manager.register_sequence(seq)
+        sync_sequence_blocks(seq, manager)
+
+    scheduler = Scheduler([seq0, seq1], block_manager=manager)
+    scheduler.schedule_next_batch()
+
+    scheduler.append_draft_tokens(seq_id=0, draft_tokens=[5, 6, 7, 8])
+    free_before = len(manager._free_block_ids)
+    scheduler.rollback(seq_id=0, rollback_to=2)
+    free_after = len(manager._free_block_ids)
+
+    scheduler.mark_finished(seq0)
+
+    assert seq0.finished is True
+    assert seq0 not in scheduler.running
+    assert seq0 in scheduler.finished
+    assert free_after >= free_before + 2
