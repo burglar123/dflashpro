@@ -137,6 +137,45 @@ def test_batch2_and_batch4_no_cross_contamination():
             assert torch.equal(row_tokens, solo), f"row {row} changed under batch={batch_size}"
 
 
+def test_stage_modes_are_rollback_safe():
+    torch.manual_seed(0)
+    model = DummyDraftModel(device=torch.device("cpu"))
+    target = DummyTargetModel(vocab_size=256)
+    prompt = torch.tensor(
+        [
+            [3, 4, 5],
+            [30, 31, 32],
+        ],
+        dtype=torch.long,
+    )
+
+    for mode in [
+        "legacy",
+        "stage_a_prefill_only",
+        "stage_b_target_only",
+        "stage_c_full_speculative",
+    ]:
+        with torch.inference_mode():
+            responses = dflash_generate_batch(
+                model=model,
+                target=target,
+                input_ids=prompt,
+                attention_mask=torch.ones_like(prompt),
+                input_lengths=torch.full((prompt.shape[0],), prompt.shape[1], dtype=torch.long),
+                mask_token_id=model.mask_token_id,
+                max_new_tokens=5,
+                block_size=1,
+                stop_token_ids=[255],
+                temperature=0.0,
+                batched_decode_mode=mode,
+            )
+        assert len(responses) == prompt.shape[0]
+        for row in range(prompt.shape[0]):
+            row_tokens = responses[row].output_ids[0]
+            assert torch.equal(row_tokens[: prompt.shape[1]], prompt[row])
+            assert (row_tokens >= 0).all()
+
+
 def test_cache_alignment_after_active_row_compaction_and_scatter():
     full_cache = DynamicCache()
     full_cache.key_cache = [

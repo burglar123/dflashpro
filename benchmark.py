@@ -4,6 +4,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import chain
+from typing import Literal
 from types import SimpleNamespace
 
 import distributed as dist
@@ -127,6 +128,14 @@ class BatchDecodeState:
     decode_start: float
     draft_prefill: bool
     active_batch_size_trace: list[int]
+
+
+BatchedDecodeMode = Literal[
+    "legacy",
+    "stage_a_prefill_only",
+    "stage_b_target_only",
+    "stage_c_full_speculative",
+]
 
 
 def gather_active_rows(cache: DynamicCache, active_indices: torch.Tensor) -> DynamicCache:
@@ -586,6 +595,210 @@ def dflash_generate_batch_staged(
     )
 
 
+def dflash_generate_batch_stage_a_prefill_only(
+    model: DFlashDraftModel,
+    target: AutoModelForCausalLM,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    input_lengths: torch.Tensor,
+    mask_token_id: int,
+    max_new_tokens: int,
+    block_size: int,
+    stop_token_ids: list[int] | None,
+    temperature: float = 0.0,
+) -> list[SimpleNamespace]:
+    state, _ = init_batch_state(
+        model=model,
+        target=target,
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        input_lengths=input_lengths,
+        mask_token_id=mask_token_id,
+        max_new_tokens=max_new_tokens,
+        block_size=block_size,
+        temperature=temperature,
+    )
+
+    responses: list[SimpleNamespace] = []
+    for row in range(input_ids.shape[0]):
+        row_input = input_ids[row : row + 1, : int(input_lengths[row].item())]
+        row_result = dflash_generate(
+            model=model,
+            target=target,
+            input_ids=row_input,
+            mask_token_id=mask_token_id,
+            max_new_tokens=max_new_tokens,
+            block_size=block_size,
+            stop_token_ids=stop_token_ids,
+            temperature=temperature,
+        )[0]
+        if temperature == 0.0:
+            expected_prefix = state.output_ids[row, : int(input_lengths[row].item()) + 1]
+            if not torch.equal(row_result.output_ids[0, : expected_prefix.numel()], expected_prefix):
+                raise ValueError("batched prefill output misaligned with per-row decode input")
+        responses.append(row_result)
+
+    return responses
+
+
+def dflash_generate_batch_stage_b_target_only(
+    model: DFlashDraftModel,
+    target: AutoModelForCausalLM,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    input_lengths: torch.Tensor,
+    mask_token_id: int,
+    max_new_tokens: int,
+    block_size: int,
+    stop_token_ids: list[int] | None,
+    temperature: float = 0.0,
+) -> list[SimpleNamespace]:
+    state, time_to_first_token = init_batch_state(
+        model=model,
+        target=target,
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        input_lengths=input_lengths,
+        mask_token_id=mask_token_id,
+        max_new_tokens=max_new_tokens,
+        block_size=block_size,
+        temperature=temperature,
+    )
+
+    while True:
+        reached_max_new_tokens = (state.start_pos - state.input_lengths) >= max_new_tokens
+        no_available_position = state.start_pos >= state.output_ids.shape[1] - 1
+
+        hit_stop_token = torch.zeros_like(state.finished_mask)
+        if stop_token_ids is not None:
+            stop_tokens = torch.tensor(stop_token_ids, device=state.output_ids.device)
+            for row in range(state.output_ids.shape[0]):
+                row_start = int(state.input_lengths[row].item())
+                row_end = int(state.start_pos[row].item()) + 1
+                row_tokens = state.output_ids[row, row_start:row_end]
+                if row_tokens.numel() > 0 and torch.isin(row_tokens, stop_tokens).any():
+                    hit_stop_token[row] = True
+
+        state.finished_mask = hit_stop_token | reached_max_new_tokens | no_available_position
+        state.active_indices = (~state.finished_mask).nonzero(as_tuple=True)[0]
+        if state.active_indices.numel() == 0:
+            break
+        state.active_batch_size_trace.append(int(state.active_indices.numel()))
+
+        active_indices = state.active_indices
+        active_batch = int(active_indices.numel())
+        active_start_pos = state.start_pos.index_select(0, active_indices)
+        if torch.unique(active_start_pos).numel() != 1:
+            raise ValueError("active rows must share start_pos in stage_b_target_only")
+        active_start_pos_scalar = int(active_start_pos[0].item())
+
+        block_output_ids = state.output_ids.index_select(0, active_indices)[
+            :, active_start_pos_scalar : active_start_pos_scalar + 1
+        ]
+        block_position_ids = state.position_ids[:, active_start_pos_scalar : active_start_pos_scalar + 1].expand(
+            active_batch, -1
+        )
+
+        active_target_cache = gather_active_rows(state.past_key_values_target, active_indices)
+        validate_cache_batch_size(active_target_cache, active_batch, "past_key_values_target")
+        with profile_phase("target.verify"):
+            with nvtx_range("target.verify.forward"):
+                output = target(
+                    block_output_ids,
+                    position_ids=block_position_ids,
+                    past_key_values=active_target_cache,
+                    use_cache=True,
+                    output_hidden_states=False,
+                )
+        next_token = sample(output.logits[:, -1:, :], temperature).squeeze(1)
+        state.output_ids[active_indices, active_start_pos_scalar + 1] = next_token
+        state.start_pos[active_indices] = active_start_pos + 1
+
+        with nvtx_range("kv_update.target_cache"):
+            active_target_cache.crop(active_start_pos_scalar + 1)
+            validate_cache_batch_size(active_target_cache, active_batch, "past_key_values_target")
+            scatter_back_rows(state.past_key_values_target, active_target_cache, active_indices)
+
+    return finalize_outputs(
+        state=state,
+        mask_token_id=mask_token_id,
+        stop_token_ids=stop_token_ids,
+        time_to_first_token=time_to_first_token,
+    )
+
+
+def dflash_generate_batch_with_mode(
+    model: DFlashDraftModel,
+    target: AutoModelForCausalLM,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    input_lengths: torch.Tensor,
+    mask_token_id: int,
+    max_new_tokens: int,
+    block_size: int,
+    stop_token_ids: list[int] | None,
+    temperature: float,
+    batched_decode_mode: BatchedDecodeMode,
+) -> list[SimpleNamespace]:
+    if batched_decode_mode == "legacy":
+        responses: list[SimpleNamespace] = []
+        for row in range(input_ids.shape[0]):
+            row_input = input_ids[row : row + 1, : int(input_lengths[row].item())]
+            responses.extend(
+                dflash_generate(
+                    model=model,
+                    target=target,
+                    input_ids=row_input,
+                    mask_token_id=mask_token_id,
+                    max_new_tokens=max_new_tokens,
+                    block_size=block_size,
+                    stop_token_ids=stop_token_ids,
+                    temperature=temperature,
+                )
+            )
+        return responses
+    if batched_decode_mode == "stage_a_prefill_only":
+        return dflash_generate_batch_stage_a_prefill_only(
+            model=model,
+            target=target,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            input_lengths=input_lengths,
+            mask_token_id=mask_token_id,
+            max_new_tokens=max_new_tokens,
+            block_size=block_size,
+            stop_token_ids=stop_token_ids,
+            temperature=temperature,
+        )
+    if batched_decode_mode == "stage_b_target_only":
+        return dflash_generate_batch_stage_b_target_only(
+            model=model,
+            target=target,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            input_lengths=input_lengths,
+            mask_token_id=mask_token_id,
+            max_new_tokens=max_new_tokens,
+            block_size=block_size,
+            stop_token_ids=stop_token_ids,
+            temperature=temperature,
+        )
+    if batched_decode_mode == "stage_c_full_speculative":
+        return dflash_generate_batch_staged(
+            model=model,
+            target=target,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            input_lengths=input_lengths,
+            mask_token_id=mask_token_id,
+            max_new_tokens=max_new_tokens,
+            block_size=block_size,
+            stop_token_ids=stop_token_ids,
+            temperature=temperature,
+        )
+    raise ValueError(f"unknown batched decode mode: {batched_decode_mode}")
+
+
 def dflash_generate_batch(
     model: DFlashDraftModel,
     target: AutoModelForCausalLM,
@@ -595,10 +808,11 @@ def dflash_generate_batch(
     mask_token_id: int,
     max_new_tokens: int,
     block_size: int,
-    stop_token_ids: list[int],
+    stop_token_ids: list[int] | None,
     temperature: float = 0.0,
+    batched_decode_mode: BatchedDecodeMode = "stage_c_full_speculative",
 ) -> list[SimpleNamespace]:
-    return dflash_generate_batch_staged(
+    return dflash_generate_batch_with_mode(
         model=model,
         target=target,
         input_ids=input_ids,
@@ -609,6 +823,7 @@ def dflash_generate_batch(
         block_size=block_size,
         stop_token_ids=stop_token_ids,
         temperature=temperature,
+        batched_decode_mode=batched_decode_mode,
     )
 
 
@@ -659,6 +874,18 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--throughput-min-speedup", type=float, default=1.2)
+    parser.add_argument(
+        "--batched-decode-mode",
+        type=str,
+        default="stage_c_full_speculative",
+        choices=[
+            "legacy",
+            "stage_a_prefill_only",
+            "stage_b_target_only",
+            "stage_c_full_speculative",
+        ],
+        help="staged rollout mode for batched decode; use legacy for fast rollback",
+    )
     args = parser.parse_args()
 
     if args.batch_size < 1:
@@ -789,6 +1016,7 @@ def main() -> None:
                         block_size=bs,
                         stop_token_ids=[tokenizer.eos_token_id],
                         temperature=args.temperature,
+                        batched_decode_mode=args.batched_decode_mode,
                     )
 
             responses_by_row = {
