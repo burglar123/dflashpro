@@ -113,6 +113,59 @@ def cuda_time() -> float:
 
 
 @dataclass
+class Sequence:
+    seq_id: int
+    token_ids: list[int]
+    num_cached_tokens: int
+    block_table: list[int]
+    pre_verify: bool
+    num_acc_tokens: int
+    finished: bool
+
+
+class Scheduler:
+    def __init__(self, sequences: list[Sequence]):
+        self.waiting: list[Sequence] = list(sequences)
+        self.running: list[Sequence] = []
+        self.finished: list[Sequence] = []
+
+    def has_pending(self) -> bool:
+        return len(self.waiting) > 0 or len(self.running) > 0
+
+    def schedule_next_batch(
+        self,
+        max_batch_tokens: int | None = None,
+        max_batch_size: int | None = None,
+    ) -> list[Sequence]:
+        while self.waiting:
+            self.running.append(self.waiting.pop(0))
+
+        if not self.running:
+            return []
+
+        self.running.sort(key=lambda seq: (seq.num_cached_tokens, seq.seq_id))
+        anchor_pos = self.running[0].num_cached_tokens
+
+        selected: list[Sequence] = []
+        selected_tokens = 0
+        for seq in self.running:
+            if seq.finished or seq.num_cached_tokens != anchor_pos:
+                continue
+            if max_batch_size is not None and len(selected) >= max_batch_size:
+                break
+            if max_batch_tokens is not None and selected_tokens + 1 > max_batch_tokens:
+                break
+            selected.append(seq)
+            selected_tokens += 1
+        return selected
+
+    def mark_finished(self, seq: Sequence) -> None:
+        seq.finished = True
+        self.running = [running_seq for running_seq in self.running if running_seq.seq_id != seq.seq_id]
+        self.finished.append(seq)
+
+
+@dataclass
 class BatchDecodeState:
     output_ids: torch.Tensor
     input_lengths: torch.Tensor
@@ -444,6 +497,7 @@ def finalize_outputs(
     mask_token_id: int,
     stop_token_ids: list[int] | None,
     time_to_first_token: float,
+    seq_ids: list[int] | None = None,
 ) -> list[SimpleNamespace]:
     assert state.output_ids.ndim == 2
     responses: list[SimpleNamespace] = []
@@ -451,7 +505,9 @@ def finalize_outputs(
     if stop_token_ids is not None:
         stop_tokens = torch.tensor(stop_token_ids, device=state.output_ids.device)
 
-    for row in range(state.output_ids.shape[0]):
+    ordered_seq_ids = seq_ids if seq_ids is not None else list(range(state.output_ids.shape[0]))
+
+    for row in ordered_seq_ids:
         row_full_output = state.output_ids[row]
         row_output = row_full_output[row_full_output != mask_token_id]
         num_input_tokens = int(state.input_lengths[row].item())
@@ -537,27 +593,33 @@ def dflash_generate_batch_staged(
         temperature=temperature,
     )
 
-    while True:
-        reached_max_new_tokens = (state.start_pos - state.input_lengths) >= max_new_tokens
-        no_available_position = state.start_pos >= state.output_ids.shape[1] - 1
+    sequences = [
+        Sequence(
+            seq_id=row,
+            token_ids=state.output_ids[row, : int(input_lengths[row].item()) + 1].tolist(),
+            num_cached_tokens=int(state.start_pos[row].item()),
+            block_table=[],
+            pre_verify=True,
+            num_acc_tokens=0,
+            finished=False,
+        )
+        for row in range(state.output_ids.shape[0])
+    ]
+    scheduler = Scheduler(sequences)
+    stop_tokens = (
+        torch.tensor(stop_token_ids, device=state.output_ids.device) if stop_token_ids is not None else None
+    )
 
-        hit_stop_token = torch.zeros_like(state.finished_mask)
-        if stop_token_ids is not None:
-            stop_tokens = torch.tensor(stop_token_ids, device=state.output_ids.device)
-            for row in range(state.output_ids.shape[0]):
-                row_start = int(state.input_lengths[row].item())
-                row_end = int(state.start_pos[row].item()) + 1
-                row_tokens = state.output_ids[row, row_start:row_end]
-                if row_tokens.numel() == 0:
-                    continue
-                if torch.isin(row_tokens, stop_tokens).any():
-                    hit_stop_token[row] = True
-
-        state.finished_mask = hit_stop_token | reached_max_new_tokens | no_available_position
-
-        state.active_indices = (~state.finished_mask).nonzero(as_tuple=True)[0]
-        if state.active_indices.numel() == 0:
+    while scheduler.has_pending():
+        scheduled_batch = scheduler.schedule_next_batch(max_batch_size=state.output_ids.shape[0])
+        if not scheduled_batch:
             break
+
+        state.active_indices = torch.tensor(
+            [seq.seq_id for seq in scheduled_batch],
+            dtype=torch.long,
+            device=state.output_ids.device,
+        )
         state.active_batch_size_trace.append(int(state.active_indices.numel()))
 
         block_output_ids, block_position_ids, active_indices = draft_propose_step(
@@ -587,11 +649,32 @@ def dflash_generate_batch_staged(
             block_size=block_size,
         )
 
+        for local_row, row in enumerate(active_indices.tolist()):
+            seq = sequences[row]
+            seq.pre_verify = False
+            seq.num_cached_tokens = int(state.start_pos[row].item())
+            seq.num_acc_tokens += int(acceptance_len_vec[local_row].item()) + 1
+            seq.token_ids = state.output_ids[row, state.output_ids[row] != mask_token_id].tolist()
+
+            row_input_length = int(state.input_lengths[row].item())
+            reached_max_new_tokens = (seq.num_cached_tokens - row_input_length) >= max_new_tokens
+            no_available_position = seq.num_cached_tokens >= state.output_ids.shape[1] - 1
+            hit_stop_token = False
+            if stop_tokens is not None:
+                row_tokens = state.output_ids[row, row_input_length : seq.num_cached_tokens + 1]
+                hit_stop_token = row_tokens.numel() > 0 and bool(torch.isin(row_tokens, stop_tokens).any())
+
+            seq.finished = reached_max_new_tokens or no_available_position or hit_stop_token
+            state.finished_mask[row] = seq.finished
+            if seq.finished:
+                scheduler.mark_finished(seq)
+
     return finalize_outputs(
         state=state,
         mask_token_id=mask_token_id,
         stop_token_ids=stop_token_ids,
         time_to_first_token=time_to_first_token,
+        seq_ids=[seq.seq_id for seq in sorted(scheduler.finished, key=lambda item: item.seq_id)],
     )
 
 
