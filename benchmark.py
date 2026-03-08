@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import random
 import time
 from contextlib import contextmanager
@@ -113,11 +114,128 @@ def cuda_time() -> float:
 
 
 @dataclass
+class BlockMapping:
+    logical_start: int
+    logical_end: int
+    physical_block_id: int
+    content_hash: str
+
+
+class BlockManager:
+    def __init__(self, block_size: int):
+        if block_size <= 0:
+            raise ValueError("block_size must be positive")
+        self.block_size = block_size
+        self._next_block_id = 0
+        self._free_block_ids: list[int] = []
+        self._block_refcount: dict[int, int] = {}
+        self._prefix_hash_to_block: dict[str, int] = {}
+
+    @staticmethod
+    def hash_tokens(token_ids: list[int], logical_start: int) -> str:
+        payload = f"{logical_start}|" + " ".join(str(token) for token in token_ids)
+        return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+    def _allocate_physical_block(self) -> int:
+        if self._free_block_ids:
+            block_id = self._free_block_ids.pop()
+        else:
+            block_id = self._next_block_id
+            self._next_block_id += 1
+        self._block_refcount.setdefault(block_id, 0)
+        return block_id
+
+    def retain(self, block_id: int) -> None:
+        if block_id not in self._block_refcount:
+            self._block_refcount[block_id] = 0
+        self._block_refcount[block_id] += 1
+
+    def release(self, block_id: int) -> None:
+        if block_id not in self._block_refcount:
+            raise ValueError(f"attempting to release unknown block_id={block_id}")
+        self._block_refcount[block_id] -= 1
+        if self._block_refcount[block_id] < 0:
+            raise ValueError(f"block_id={block_id} refcount became negative")
+        if self._block_refcount[block_id] == 0:
+            self._free_block_ids.append(block_id)
+
+    def acquire_block(
+        self,
+        token_ids: list[int],
+        logical_start: int,
+        allow_prefix_reuse: bool = True,
+    ) -> tuple[int, str, bool]:
+        content_hash = self.hash_tokens(token_ids, logical_start)
+        cache_hit = allow_prefix_reuse and content_hash in self._prefix_hash_to_block
+        if cache_hit:
+            block_id = self._prefix_hash_to_block[content_hash]
+        else:
+            block_id = self._allocate_physical_block()
+            self._prefix_hash_to_block[content_hash] = block_id
+        self.retain(block_id)
+        return block_id, content_hash, cache_hit
+
+    def rollback_sequence(self, sequence: "Sequence", new_num_cached_tokens: int) -> None:
+        if new_num_cached_tokens > sequence.num_cached_tokens:
+            raise ValueError("rollback target cannot exceed current num_cached_tokens")
+        while sequence.block_table and sequence.block_table[-1].logical_start >= new_num_cached_tokens:
+            removed = sequence.block_table.pop()
+            self.release(removed.physical_block_id)
+
+    def check_consistency(self, sequence: "Sequence") -> None:
+        mapped_tokens = sum(mapping.logical_end - mapping.logical_start for mapping in sequence.block_table)
+        if mapped_tokens != sequence.num_cached_tokens:
+            raise ValueError(
+                f"sequence {sequence.seq_id} cache mismatch: num_cached_tokens={sequence.num_cached_tokens}, mapped_tokens={mapped_tokens}"
+            )
+
+
+def sync_sequence_blocks(sequence: "Sequence", block_manager: BlockManager) -> None:
+    target_num_tokens = sequence.num_cached_tokens
+    block_size = block_manager.block_size
+
+    expected_mappings: list[tuple[int, int, list[int]]] = []
+    for block_start in range(0, target_num_tokens, block_size):
+        block_end = min(block_start + block_size, target_num_tokens)
+        expected_mappings.append((block_start, block_end, sequence.token_ids[block_start:block_end]))
+
+    longest_prefix = 0
+    for mapping, expected in zip(sequence.block_table, expected_mappings):
+        expected_start, expected_end, expected_tokens = expected
+        if mapping.logical_start != expected_start or mapping.logical_end != expected_end:
+            break
+        if mapping.content_hash != block_manager.hash_tokens(expected_tokens, expected_start):
+            break
+        longest_prefix += 1
+
+    for stale_mapping in sequence.block_table[longest_prefix:]:
+        block_manager.release(stale_mapping.physical_block_id)
+    sequence.block_table = sequence.block_table[:longest_prefix]
+
+    for logical_start, logical_end, block_tokens in expected_mappings[longest_prefix:]:
+        physical_block_id, content_hash, _ = block_manager.acquire_block(
+            block_tokens,
+            logical_start=logical_start,
+            allow_prefix_reuse=True,
+        )
+        sequence.block_table.append(
+            BlockMapping(
+                logical_start=logical_start,
+                logical_end=logical_end,
+                physical_block_id=physical_block_id,
+                content_hash=content_hash,
+            )
+        )
+
+    block_manager.check_consistency(sequence)
+
+
+@dataclass
 class Sequence:
     seq_id: int
     token_ids: list[int]
     num_cached_tokens: int
-    block_table: list[int]
+    block_table: list[BlockMapping]
     pre_verify: bool
     num_acc_tokens: int
     finished: bool
@@ -269,6 +387,20 @@ def collate_prompts(
     return input_ids_padded, attention_mask, input_lengths
 
 
+def build_batch_cache_metadata(
+    scheduled_batch: list[Sequence],
+    active_start_pos: torch.Tensor,
+) -> dict[str, list[list[int]] | list[int]]:
+    block_tables = [[mapping.physical_block_id for mapping in seq.block_table] for seq in scheduled_batch]
+    context_lens = [int(seq.num_cached_tokens) for seq in scheduled_batch]
+    slot_mapping = [int(pos.item()) for pos in active_start_pos]
+    return {
+        "block_tables": block_tables,
+        "context_lens": context_lens,
+        "slot_mapping": slot_mapping,
+    }
+
+
 @torch.inference_mode()
 def init_batch_state(
     model: DFlashDraftModel,
@@ -353,6 +485,7 @@ def draft_propose_step(
     model: DFlashDraftModel,
     target: AutoModelForCausalLM,
     state: BatchDecodeState,
+    scheduled_batch: list[Sequence],
     block_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert state.output_ids.ndim == 2
@@ -365,6 +498,7 @@ def draft_propose_step(
     assert torch.unique(active_start_pos).numel() == 1, "active rows must share start_pos"
     active_start_pos_scalar = int(active_start_pos[0].item())
     assert active_start_pos_scalar < state.max_length
+    _ = build_batch_cache_metadata(scheduled_batch=scheduled_batch, active_start_pos=active_start_pos)
 
     block_output_ids = state.output_ids.index_select(0, active_indices)[:, active_start_pos_scalar : active_start_pos_scalar + block_size].clone()
     block_position_ids = state.position_ids[:, active_start_pos_scalar : active_start_pos_scalar + block_size].expand(active_batch, -1)
@@ -410,6 +544,7 @@ def target_verify_step(
     model: DFlashDraftModel,
     target: AutoModelForCausalLM,
     state: BatchDecodeState,
+    scheduled_batch: list[Sequence],
     active_indices: torch.Tensor,
     block_output_ids: torch.Tensor,
     block_position_ids: torch.Tensor,
@@ -421,6 +556,8 @@ def target_verify_step(
     assert block_output_ids.shape[0] == active_batch
     assert block_output_ids.shape[1] == block_size
     assert block_position_ids.shape[0] == active_batch and block_position_ids.shape[1] == block_size
+    active_start_pos = state.start_pos.index_select(0, active_indices)
+    _ = build_batch_cache_metadata(scheduled_batch=scheduled_batch, active_start_pos=active_start_pos)
 
     active_target_cache = gather_active_rows(state.past_key_values_target, active_indices)
     validate_cache_batch_size(active_target_cache, active_batch, "past_key_values_target")
@@ -581,6 +718,7 @@ def dflash_generate_batch_staged(
     stop_token_ids: list[int] | None,
     temperature: float = 0.0,
 ) -> list[SimpleNamespace]:
+    block_manager = BlockManager(block_size=block_size)
     state, time_to_first_token = init_batch_state(
         model=model,
         target=target,
@@ -605,12 +743,16 @@ def dflash_generate_batch_staged(
         )
         for row in range(state.output_ids.shape[0])
     ]
+    for sequence in sequences:
+        sync_sequence_blocks(sequence, block_manager)
     scheduler = Scheduler(sequences)
     stop_tokens = (
         torch.tensor(stop_token_ids, device=state.output_ids.device) if stop_token_ids is not None else None
     )
 
     while scheduler.has_pending():
+        for sequence in sequences:
+            block_manager.check_consistency(sequence)
         scheduled_batch = scheduler.schedule_next_batch(max_batch_size=state.output_ids.shape[0])
         if not scheduled_batch:
             break
@@ -626,12 +768,22 @@ def dflash_generate_batch_staged(
             model=model,
             target=target,
             state=state,
+            scheduled_batch=scheduled_batch,
             block_size=block_size,
         )
+
+        staged_old_state: dict[int, tuple[int, list[int]]] = {}
+        for local_row, seq in enumerate(scheduled_batch):
+            staged_old_state[seq.seq_id] = (seq.num_cached_tokens, list(seq.token_ids))
+            seq.token_ids = seq.token_ids[: seq.num_cached_tokens] + block_output_ids[local_row].tolist()
+            seq.num_cached_tokens = staged_old_state[seq.seq_id][0] + block_size
+            sync_sequence_blocks(seq, block_manager)
+
         posterior, acceptance_len_vec, target_hidden, active_target_cache = target_verify_step(
             model=model,
             target=target,
             state=state,
+            scheduled_batch=scheduled_batch,
             active_indices=active_indices,
             block_output_ids=block_output_ids,
             block_position_ids=block_position_ids,
@@ -652,9 +804,15 @@ def dflash_generate_batch_staged(
         for local_row, row in enumerate(active_indices.tolist()):
             seq = sequences[row]
             seq.pre_verify = False
-            seq.num_cached_tokens = int(state.start_pos[row].item())
             seq.num_acc_tokens += int(acceptance_len_vec[local_row].item()) + 1
-            seq.token_ids = state.output_ids[row, state.output_ids[row] != mask_token_id].tolist()
+            prev_cached_tokens, prev_token_ids = staged_old_state[row]
+            accepted_len = int(acceptance_len_vec[local_row].item()) + 1
+            accepted_tokens = block_output_ids[local_row, :accepted_len].tolist()
+            verify_token = int(posterior[local_row, accepted_len - 1].item())
+            seq.token_ids = prev_token_ids[:prev_cached_tokens] + accepted_tokens + [verify_token]
+            seq.num_cached_tokens = int(state.start_pos[row].item())
+            block_manager.rollback_sequence(seq, seq.num_cached_tokens)
+            sync_sequence_blocks(seq, block_manager)
 
             row_input_length = int(state.input_lengths[row].item())
             reached_max_new_tokens = (seq.num_cached_tokens - row_input_length) >= max_new_tokens
