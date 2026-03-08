@@ -127,11 +127,47 @@ class BatchDecodeState:
     draft_prefill: bool
 
 
+def collate_prompts(
+    input_ids_list: list[torch.Tensor],
+    pad_token_id: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if not input_ids_list:
+        raise ValueError("input_ids_list must not be empty")
+
+    batch_size = len(input_ids_list)
+    input_lengths = torch.tensor(
+        [tensor.shape[-1] for tensor in input_ids_list],
+        device=input_ids_list[0].device,
+        dtype=torch.long,
+    )
+    max_length = int(input_lengths.max().item())
+    input_ids_padded = torch.full(
+        (batch_size, max_length),
+        pad_token_id,
+        dtype=torch.long,
+        device=input_ids_list[0].device,
+    )
+    attention_mask = torch.zeros(
+        (batch_size, max_length),
+        dtype=torch.long,
+        device=input_ids_list[0].device,
+    )
+
+    for row, input_ids in enumerate(input_ids_list):
+        length = input_ids.shape[-1]
+        input_ids_padded[row, :length] = input_ids[0]
+        attention_mask[row, :length] = 1
+
+    return input_ids_padded, attention_mask, input_lengths
+
+
 @torch.inference_mode()
 def init_batch_state(
     model: DFlashDraftModel,
     target: AutoModelForCausalLM,
     input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    input_lengths: torch.Tensor,
     mask_token_id: int,
     max_new_tokens: int,
     block_size: int,
@@ -151,6 +187,8 @@ def init_batch_state(
     assert output_ids.ndim == 2, "output_ids must be 2D"
     position_ids = torch.arange(output_ids.shape[1], device=model.device).unsqueeze(0)
     assert position_ids.ndim == 2 and position_ids.shape[0] == 1
+    prefill_position_ids = attention_mask.long().cumsum(dim=-1) - 1
+    prefill_position_ids = prefill_position_ids.masked_fill(attention_mask == 0, 0)
 
     past_key_values_target = DynamicCache()
     past_key_values_draft = DynamicCache()
@@ -159,7 +197,8 @@ def init_batch_state(
     with nvtx_range("target.prefill.forward"):
         output = target(
             input_ids,
-            position_ids=position_ids[:, :num_input_tokens],
+            attention_mask=attention_mask,
+            position_ids=prefill_position_ids,
             past_key_values=past_key_values_target,
             use_cache=True,
             logits_to_keep=1,
@@ -167,8 +206,15 @@ def init_batch_state(
         )
 
     assert output.logits.ndim == 3, "target logits must be [B, T, V]"
-    output_ids[:, :num_input_tokens] = input_ids
-    output_ids[:, num_input_tokens : num_input_tokens + 1] = sample(output.logits, temperature)
+    for row in range(batch_size):
+        row_input_length = int(input_lengths[row].item())
+        output_ids[row, :row_input_length] = input_ids[row, :row_input_length]
+
+    last_token_indices = (input_lengths - 1).to(torch.long)
+    batch_indices = torch.arange(batch_size, device=model.device)
+    next_token_logits = output.logits[batch_indices, last_token_indices].unsqueeze(1)
+    next_tokens = sample(next_token_logits, temperature)
+    output_ids[:, num_input_tokens : num_input_tokens + 1] = next_tokens
 
     target_hidden = None
     if block_size > 1:
@@ -177,7 +223,7 @@ def init_batch_state(
 
     state = BatchDecodeState(
         output_ids=output_ids,
-        input_lengths=torch.full((batch_size,), num_input_tokens, device=model.device, dtype=torch.long),
+        input_lengths=input_lengths,
         start_pos=num_input_tokens,
         finished_mask=torch.zeros(batch_size, dtype=torch.bool, device=model.device),
         active_indices=torch.arange(batch_size, device=model.device, dtype=torch.long),
@@ -351,10 +397,14 @@ def dflash_generate(
     temperature: float = 0.0,
 ) -> SimpleNamespace:
     assert input_ids.ndim == 2 and input_ids.shape[0] == 1, "dflash_generate compatibility path expects B=1"
+    attention_mask = torch.ones_like(input_ids, dtype=torch.long)
+    input_lengths = torch.tensor([input_ids.shape[1]], device=input_ids.device, dtype=torch.long)
     responses = dflash_generate_batch_staged(
         model=model,
         target=target,
         input_ids=input_ids,
+        attention_mask=attention_mask,
+        input_lengths=input_lengths,
         mask_token_id=mask_token_id,
         max_new_tokens=max_new_tokens,
         block_size=block_size,
@@ -368,6 +418,8 @@ def dflash_generate_batch_staged(
     model: DFlashDraftModel,
     target: AutoModelForCausalLM,
     input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    input_lengths: torch.Tensor,
     mask_token_id: int,
     max_new_tokens: int,
     block_size: int,
@@ -378,6 +430,8 @@ def dflash_generate_batch_staged(
         model=model,
         target=target,
         input_ids=input_ids,
+        attention_mask=attention_mask,
+        input_lengths=input_lengths,
         mask_token_id=mask_token_id,
         max_new_tokens=max_new_tokens,
         block_size=block_size,
@@ -425,28 +479,27 @@ def dflash_generate_batch_staged(
 def dflash_generate_batch(
     model: DFlashDraftModel,
     target: AutoModelForCausalLM,
-    input_ids_batch: list[torch.Tensor],
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    input_lengths: torch.Tensor,
     mask_token_id: int,
     max_new_tokens: int,
     block_size: int,
     stop_token_ids: list[int],
     temperature: float = 0.0,
 ) -> list[SimpleNamespace]:
-    responses = []
-    for input_ids in input_ids_batch:
-        responses.append(
-            dflash_generate(
-                model=model,
-                target=target,
-                input_ids=input_ids,
-                mask_token_id=mask_token_id,
-                max_new_tokens=max_new_tokens,
-                block_size=block_size,
-                stop_token_ids=stop_token_ids,
-                temperature=temperature,
-            )
-        )
-    return responses
+    return dflash_generate_batch_staged(
+        model=model,
+        target=target,
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        input_lengths=input_lengths,
+        mask_token_id=mask_token_id,
+        max_new_tokens=max_new_tokens,
+        block_size=block_size,
+        stop_token_ids=stop_token_ids,
+        temperature=temperature,
+    )
 
 
 def main() -> None:
@@ -509,6 +562,14 @@ def main() -> None:
     block_size = args.block_size if args.block_size is not None else draft_model.block_size
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
+    if tokenizer.pad_token_id is None:
+        if tokenizer.eos_token_id is None:
+            raise ValueError("Tokenizer does not provide a pad_token_id or eos_token_id for fallback")
+        tokenizer.pad_token = tokenizer.eos_token
+        logger.warning(
+            "Tokenizer has no pad token. Falling back to eos token id {} as pad token.",
+            tokenizer.pad_token_id,
+        )
     dataset = load_and_process_dataset(args.dataset)
 
     if args.max_samples is not None and len(dataset) > args.max_samples:
@@ -546,13 +607,20 @@ def main() -> None:
             if not input_ids_batch:
                 continue
 
+            input_ids_padded, attention_mask, input_lengths = collate_prompts(
+                input_ids_list=input_ids_batch,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+
             batch_response = {}
             for bs in [1, block_size]:
                 with nvtx_range(f"generate.block_size_{bs}"):
                     batch_response[bs] = dflash_generate_batch(
                         model=draft_model,
                         target=target,
-                        input_ids_batch=input_ids_batch,
+                        input_ids=input_ids_padded,
+                        attention_mask=attention_mask,
+                        input_lengths=input_lengths,
                         mask_token_id=draft_model.mask_token_id,
                         max_new_tokens=args.max_new_tokens,
                         block_size=bs,
