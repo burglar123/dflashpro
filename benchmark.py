@@ -343,7 +343,7 @@ def target_verify_step(
     block_position_ids: torch.Tensor,
     block_size: int,
     temperature: float,
-) -> tuple[torch.Tensor, torch.Tensor | None, DynamicCache]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, DynamicCache]:
     assert block_output_ids.ndim == 2 and block_position_ids.ndim == 2
     active_batch = int(active_indices.numel())
     assert block_output_ids.shape[0] == active_batch
@@ -365,13 +365,15 @@ def target_verify_step(
 
     posterior = sample(output.logits, temperature)
     assert posterior.ndim == 2 and posterior.shape[0] == block_output_ids.shape[0]
+    acceptance_len_vec = (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)
+    assert acceptance_len_vec.ndim == 1 and acceptance_len_vec.shape[0] == block_output_ids.shape[0]
 
     target_hidden = None
     if block_size > 1:
         target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)
         assert target_hidden.ndim == 3 and target_hidden.shape[0] == block_output_ids.shape[0]
 
-    return posterior, target_hidden, active_target_cache
+    return posterior, acceptance_len_vec, target_hidden, active_target_cache
 
 
 def apply_acceptance_step(
@@ -379,6 +381,7 @@ def apply_acceptance_step(
     active_indices: torch.Tensor,
     block_output_ids: torch.Tensor,
     posterior: torch.Tensor,
+    acceptance_len_vec: torch.Tensor,
     target_hidden: torch.Tensor | None,
     active_target_cache: DynamicCache,
     block_size: int,
@@ -386,24 +389,23 @@ def apply_acceptance_step(
     assert block_output_ids.ndim == 2 and posterior.ndim == 2
     active_batch = int(active_indices.numel())
     assert block_output_ids.shape[0] == posterior.shape[0] == active_batch
-    acceptance_lengths = (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)
-    assert acceptance_lengths.ndim == 1 and acceptance_lengths.shape[0] == active_batch
-    assert torch.unique(acceptance_lengths).numel() == 1, "Current cache update requires synced acceptance"
+    assert acceptance_len_vec.ndim == 1 and acceptance_len_vec.shape[0] == active_batch
+    if torch.any((acceptance_len_vec < 0) | (acceptance_len_vec > block_size - 1)):
+        raise ValueError(f"acceptance_len must be in [0, {block_size - 1}] for each active row")
 
-    acceptance_length = int(acceptance_lengths[0].item())
     active_start_pos = state.start_pos.index_select(0, active_indices)
-    assert torch.unique(active_start_pos).numel() == 1, "active rows must share start_pos"
-    active_start_pos_scalar = int(active_start_pos[0].item())
 
-    state.output_ids[active_indices, active_start_pos_scalar : active_start_pos_scalar + acceptance_length + 1] = (
-        block_output_ids[:, : acceptance_length + 1]
-    )
-    state.output_ids[active_indices, active_start_pos_scalar + acceptance_length + 1] = posterior[:, acceptance_length]
+    for local_row, row in enumerate(active_indices.tolist()):
+        acceptance_len = int(acceptance_len_vec[local_row].item())
+        row_start_pos = int(active_start_pos[local_row].item())
+        row_end_pos = row_start_pos + acceptance_len + 1
+        state.output_ids[row, row_start_pos:row_end_pos] = block_output_ids[local_row, : acceptance_len + 1]
+        state.output_ids[row, row_end_pos] = posterior[local_row, acceptance_len]
+        state.acceptance_lengths_per_row[row].append(acceptance_len + 1)
 
-    for row in active_indices.tolist():
-        state.acceptance_lengths_per_row[row].append(acceptance_length + 1)
+    state.start_pos[active_indices] = active_start_pos + acceptance_len_vec + 1
+    state.finished_mask[active_indices] |= state.start_pos.index_select(0, active_indices) >= state.max_length
 
-    state.start_pos[active_indices] = state.start_pos.index_select(0, active_indices) + (acceptance_length + 1)
     with nvtx_range("kv_update.target_cache"):
         new_start_pos_scalar = int(state.start_pos[active_indices][0].item())
         active_target_cache.crop(new_start_pos_scalar)
@@ -412,7 +414,9 @@ def apply_acceptance_step(
     if block_size > 1 and target_hidden is not None:
         if state.target_hidden is None:
             raise ValueError("target_hidden must be initialized when block_size > 1")
-        state.target_hidden[active_indices] = target_hidden[:, : acceptance_length + 1, :]
+        for local_row, row in enumerate(active_indices.tolist()):
+            acceptance_len = int(acceptance_len_vec[local_row].item())
+            state.target_hidden[row] = target_hidden[local_row, : acceptance_len + 1, :]
 
 
 
@@ -524,7 +528,7 @@ def dflash_generate_batch_staged(
             state=state,
             block_size=block_size,
         )
-        posterior, target_hidden, active_target_cache = target_verify_step(
+        posterior, acceptance_len_vec, target_hidden, active_target_cache = target_verify_step(
             model=model,
             target=target,
             state=state,
@@ -539,6 +543,7 @@ def dflash_generate_batch_staged(
             active_indices=active_indices,
             block_output_ids=block_output_ids,
             posterior=posterior,
+            acceptance_len_vec=acceptance_len_vec,
             target_hidden=target_hidden,
             active_target_cache=active_target_cache,
             block_size=block_size,
