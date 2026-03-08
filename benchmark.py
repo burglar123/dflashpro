@@ -680,19 +680,33 @@ def main() -> None:
     ):
         batch_indices = indices[chunk_start : chunk_start + args.batch_size]
         batch_instances = [dataset[idx] for idx in batch_indices]
-        batch_messages = [[] for _ in batch_instances]
-        max_turns = max(len(instance["turns"]) for instance in batch_instances)
+        row_state = {
+            row_id: {
+                "turn_index": 0,
+                "messages": [],
+                "done": False,
+                "instance": instance,
+            }
+            for row_id, instance in enumerate(batch_instances)
+        }
+        active_rows = list(row_state.keys())
 
-        for turn_index in range(max_turns):
-            active_rows = []
+        while active_rows:
+            prompt_rows = []
             input_ids_batch = []
-            for row, instance in enumerate(batch_instances):
+            for row_id in active_rows:
+                state = row_state[row_id]
+                turn_index = state["turn_index"]
+                instance = state["instance"]
+
                 if turn_index >= len(instance["turns"]):
+                    state["done"] = True
                     continue
+
                 user_content = instance["turns"][turn_index]
-                batch_messages[row].append({"role": "user", "content": user_content})
+                state["messages"].append({"role": "user", "content": user_content})
                 input_text = tokenizer.apply_chat_template(
-                    batch_messages[row],
+                    state["messages"],
                     tokenize=False,
                     add_generation_prompt=True,
                     enable_thinking=False,
@@ -700,7 +714,9 @@ def main() -> None:
                 input_ids_batch.append(
                     tokenizer.encode(input_text, return_tensors="pt").to(target.device)
                 )
-                active_rows.append(row)
+                prompt_rows.append(row_id)
+
+            active_rows = [row_id for row_id in active_rows if not row_state[row_id]["done"]]
 
             if not input_ids_batch:
                 continue
@@ -726,16 +742,31 @@ def main() -> None:
                         temperature=args.temperature,
                     )
 
-            for local_i, row in enumerate(active_rows):
-                response = {
-                    1: batch_response[1][local_i],
-                    block_size: batch_response[block_size][local_i],
+            responses_by_row = {
+                row_id: {
+                    1: baseline_resp,
+                    block_size: spec_resp,
                 }
+                for row_id, baseline_resp, spec_resp in zip(
+                    prompt_rows,
+                    batch_response[1],
+                    batch_response[block_size],
+                    strict=True,
+                )
+            }
+
+            for row_id, response in responses_by_row.items():
+                state = row_state[row_id]
                 spec_response = response[block_size]
                 generated_ids = spec_response.output_ids[0, spec_response.num_input_tokens :]
                 output_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
-                batch_messages[row].append({"role": "assistant", "content": output_text})
+                state["messages"].append({"role": "assistant", "content": output_text})
+                state["turn_index"] += 1
+                if state["turn_index"] >= len(state["instance"]["turns"]):
+                    state["done"] = True
                 responses.append(response)
+
+            active_rows = [row_id for row_id in active_rows if not row_state[row_id]["done"]]
 
     if dist.size() > 1:
         responses = dist.gather(responses, dst=0)
