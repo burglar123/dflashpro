@@ -437,6 +437,65 @@ def validate_sequence_runtime_consistency(
             f"expected_forward_visible_context_len={expected_forward_visible_context_len}, "
             f"forward_visible_context_len={forward_visible_context_len}, pre_verify={sequence.pre_verify}"
         )
+    if sequence.pending_kv_append:
+        pending_len = len(sequence.pending_kv_append)
+        if pending_len > sequence.num_cached_tokens:
+            raise ValueError(
+                f"sequence {sequence.seq_id} pending kv mismatch: pending_len={pending_len}, "
+                f"num_cached_tokens={sequence.num_cached_tokens}"
+            )
+        pending_start = sequence.num_cached_tokens - pending_len
+        pending_suffix = sequence.token_ids[pending_start : sequence.num_cached_tokens]
+        if pending_suffix != sequence.pending_kv_append:
+            raise ValueError(
+                f"sequence {sequence.seq_id} pending kv suffix mismatch: "
+                f"pending={sequence.pending_kv_append}, suffix={pending_suffix}"
+            )
+
+
+def commit_pending_kv(
+    sequence: Sequence,
+    block_manager: BlockManager,
+    target_cache_view: DynamicCache | None = None,
+    rollback_to: int | None = None,
+) -> None:
+    del target_cache_view
+    if not sequence.pending_kv_append:
+        validate_sequence_runtime_consistency(
+            sequence=sequence,
+            forward_visible_context_len=len(sequence.token_ids),
+            block_manager=block_manager,
+        )
+        return
+
+    pending_len = len(sequence.pending_kv_append)
+    if sequence.num_cached_tokens < pending_len:
+        raise ValueError(
+            f"sequence {sequence.seq_id} commit underflow: "
+            f"num_cached_tokens={sequence.num_cached_tokens}, pending_len={pending_len}"
+        )
+
+    pending_start = sequence.num_cached_tokens - pending_len
+    if sequence.token_ids[pending_start : sequence.num_cached_tokens] != sequence.pending_kv_append:
+        raise ValueError(
+            f"sequence {sequence.seq_id} pending kv does not match token suffix before commit"
+        )
+
+    try:
+        sync_sequence_blocks(sequence, block_manager)
+        validate_sequence_runtime_consistency(
+            sequence=sequence,
+            forward_visible_context_len=len(sequence.token_ids),
+            block_manager=block_manager,
+        )
+    except Exception:
+        if rollback_to is not None:
+            block_manager.rollback(sequence.seq_id, rollback_to)
+            sequence.token_ids = sequence.token_ids[: sequence.num_cached_tokens]
+            sequence.pending_kv_append.clear()
+        raise
+
+    sequence.pending_kv_append.clear()
 
 
 def collate_prompts(
@@ -1075,7 +1134,12 @@ def dflash_generate_batch_staged(
             scheduler.rollback(seq.seq_id, draft_start + accepted_len)
             seq.token_ids = seq.token_ids[: seq.num_cached_tokens] + [verify_token]
             seq.num_cached_tokens += 1
-            sync_sequence_blocks(seq, block_manager)
+            commit_pending_kv(
+                sequence=seq,
+                block_manager=block_manager,
+                target_cache_view=state.past_key_values_target,
+                rollback_to=draft_start,
+            )
 
             row_input_length = int(state.input_lengths[row].item())
             reached_max_new_tokens = (seq.num_cached_tokens - row_input_length) >= max_new_tokens

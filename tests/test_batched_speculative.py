@@ -909,3 +909,90 @@ def test_stage_c_rollback_paths_are_stable_with_acceptance_and_eos(
     assert torch.equal(first, second), f"scenario {scenario} output drifted after rollback"
     if expect_stop:
         assert verify_token in first.tolist()
+
+
+@pytest.mark.parametrize(
+    "acceptance_len",
+    [0, 1, 2],
+)
+def test_stage_c_commits_pending_kv_and_can_continue_forward(monkeypatch, acceptance_len: int):
+    import benchmark as benchmark_module
+
+    model = DummyDraftModel(device=torch.device("cpu"))
+    target = DummyTargetModel(vocab_size=256)
+    prompt = torch.tensor([[10, 11, 12]], dtype=torch.long)
+
+    original_target_verify_step = benchmark_module.target_verify_step
+    original_commit_pending_kv = benchmark_module.commit_pending_kv
+
+    verify_round = {"value": 0}
+    commit_records: list[tuple[int, int]] = []
+
+    def scripted_target_verify_step(
+        model,
+        target,
+        state,
+        scheduled_batch,
+        active_indices,
+        block_output_ids,
+        block_position_ids,
+        block_size,
+        temperature,
+    ):
+        active_batch = int(active_indices.numel())
+        verify_round["value"] += 1
+        posterior = torch.full(
+            (active_batch, block_size),
+            170 + verify_round["value"],
+            dtype=torch.long,
+            device=state.output_ids.device,
+        )
+        acceptance_len_vec = torch.full(
+            (active_batch,),
+            acceptance_len,
+            dtype=torch.long,
+            device=state.output_ids.device,
+        )
+        active_target_cache = benchmark_module.gather_active_rows(state.past_key_values_target, active_indices)
+        hidden_dim = int(state.target_hidden.shape[-1])
+        target_hidden = torch.zeros(
+            (active_batch, block_size, hidden_dim),
+            dtype=state.target_hidden.dtype,
+            device=state.target_hidden.device,
+        )
+        return posterior, acceptance_len_vec, target_hidden, active_target_cache
+
+    def wrapped_commit_pending_kv(sequence, block_manager, target_cache_view, rollback_to=None):
+        original_commit_pending_kv(
+            sequence=sequence,
+            block_manager=block_manager,
+            target_cache_view=target_cache_view,
+            rollback_to=rollback_to,
+        )
+        commit_records.append((sequence.seq_id, len(sequence.pending_kv_append)))
+
+    monkeypatch.setattr(benchmark_module, "target_verify_step", scripted_target_verify_step)
+    monkeypatch.setattr(benchmark_module, "commit_pending_kv", wrapped_commit_pending_kv)
+
+    with torch.inference_mode():
+        response = benchmark_module.dflash_generate_batch(
+            model=model,
+            target=target,
+            input_ids=prompt,
+            attention_mask=torch.ones_like(prompt),
+            input_lengths=torch.tensor([prompt.shape[1]], dtype=torch.long),
+            mask_token_id=model.mask_token_id,
+            max_new_tokens=5,
+            block_size=3,
+            stop_token_ids=[255],
+            temperature=0.0,
+            batched_decode_mode="stage_c_full_speculative",
+        )[0]
+
+    assert verify_round["value"] >= 2, "decode should continue to next verify round"
+    assert commit_records, "pending kv commit should be called"
+    assert all(pending_len == 0 for _, pending_len in commit_records)
+    assert response.output_ids.shape[1] > prompt.shape[1] + 1
+
+    monkeypatch.setattr(benchmark_module, "target_verify_step", original_target_verify_step)
+    monkeypatch.setattr(benchmark_module, "commit_pending_kv", original_commit_pending_kv)
