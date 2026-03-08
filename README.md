@@ -154,6 +154,10 @@ python benchmark_sglang.py \
   - `stage_b_target_only`: active-row batched decode with speculative disabled,
   - `stage_c_full_speculative`: full draft+verify+acceptance vectorization,
   - `legacy`: fallback to per-row generation path.
+- Packed metadata compatibility for `benchmark.py` target verify (`slot_mapping/context_lens/block_tables`):
+  - **Supported runners/models**: targets whose `forward`/`__call__` accepts these kwargs explicitly or via `**kwargs` (e.g., serving stacks with paged-cache packed metadata support).
+  - **Not supported**: plain Hugging Face causal LM forwards that reject these kwargs.
+  - When `--batched-decode-mode stage_c_full_speculative` is requested but packed metadata is unsupported, the script logs a warning and auto-falls back to `stage_b_target_only` compatibility mode.
 
 ### Profiling SGLang server correctly (nsys + ncu)
 

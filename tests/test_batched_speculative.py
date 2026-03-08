@@ -77,6 +77,28 @@ class DummyTargetModel:
         return SimpleNamespace(logits=logits, hidden_states=hidden_states)
 
 
+
+
+class DummyTargetModelNoPackedKwargs(DummyTargetModel):
+    def __call__(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        use_cache=True,
+        logits_to_keep=None,
+        output_hidden_states=False,
+    ):
+        return super().__call__(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            logits_to_keep=logits_to_keep,
+            output_hidden_states=output_hidden_states,
+        )
 def run_single(model, target, prompt_ids, max_new_tokens=8):
     with torch.inference_mode():
         out = dflash_generate(
@@ -367,6 +389,93 @@ def test_target_verify_step_handles_ragged_verify_lengths_without_misalignment()
     assert posterior[0, 0].item() == 14
     assert posterior[1, 0].item() == 24
 
+
+
+def test_target_verify_step_falls_back_when_target_does_not_support_packed_metadata_kwargs():
+    model = DummyDraftModel(device=torch.device("cpu"))
+    target = DummyTargetModelNoPackedKwargs(vocab_size=256)
+
+    state, _ = init_batch_state(
+        model=model,
+        target=target,
+        input_ids=torch.tensor([[10, 11, 12], [20, 21, 22]], dtype=torch.long),
+        attention_mask=torch.ones((2, 3), dtype=torch.long),
+        input_lengths=torch.tensor([3, 3], dtype=torch.long),
+        mask_token_id=model.mask_token_id,
+        max_new_tokens=4,
+        block_size=3,
+        temperature=0.0,
+    )
+
+    scheduled_batch = [
+        Sequence(
+            seq_id=0,
+            token_ids=[10, 11, 12, 13],
+            num_cached_tokens=3,
+            block_table=[],
+            pre_verify=True,
+            num_acc_tokens=0,
+            finished=False,
+            pending_kv_append=[],
+        ),
+        Sequence(
+            seq_id=1,
+            token_ids=[20, 21, 22, 23],
+            num_cached_tokens=3,
+            block_table=[],
+            pre_verify=False,
+            num_acc_tokens=0,
+            finished=False,
+            pending_kv_append=[],
+        ),
+    ]
+
+    posterior, acceptance_len_vec, _, _ = target_verify_step(
+        model=model,
+        target=target,
+        state=state,
+        scheduled_batch=scheduled_batch,
+        active_indices=torch.tensor([0, 1], dtype=torch.long),
+        block_output_ids=torch.tensor([[13, 99, 99], [23, 24, 25]], dtype=torch.long),
+        block_position_ids=torch.tensor([[3, 4, 5], [3, 4, 5]], dtype=torch.long),
+        block_size=3,
+        temperature=0.0,
+    )
+
+    assert acceptance_len_vec.tolist() == [0, 2]
+    assert posterior.shape == torch.Size([2, 3])
+
+
+def test_stage_c_mode_auto_falls_back_to_stage_b_when_packed_metadata_is_unsupported(monkeypatch):
+    import benchmark as benchmark_module
+
+    model = DummyDraftModel(device=torch.device("cpu"))
+    target = DummyTargetModelNoPackedKwargs(vocab_size=256)
+    prompt = torch.tensor([[10, 11, 12]], dtype=torch.long)
+
+    called = {"stage_b": False}
+
+    def fake_stage_b(**kwargs):
+        called["stage_b"] = True
+        return [SimpleNamespace(output_ids=prompt, num_input_tokens=3, num_output_tokens=0, time_to_first_token=0.0, time_per_output_token=0.0, acceptance_lengths=[], active_batch_size_trace=[])]
+
+    monkeypatch.setattr(benchmark_module, "dflash_generate_batch_stage_b_target_only", fake_stage_b)
+
+    benchmark_module.dflash_generate_batch_with_mode(
+        model=model,
+        target=target,
+        input_ids=prompt,
+        attention_mask=torch.ones_like(prompt),
+        input_lengths=torch.tensor([3], dtype=torch.long),
+        mask_token_id=model.mask_token_id,
+        max_new_tokens=2,
+        block_size=2,
+        stop_token_ids=[255],
+        temperature=0.0,
+        batched_decode_mode="stage_c_full_speculative",
+    )
+
+    assert called["stage_b"] is True
 
 def _build_sequence(seq_id: int, token_ids: list[int], num_cached_tokens: int) -> Sequence:
     return Sequence(

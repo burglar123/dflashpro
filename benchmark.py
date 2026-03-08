@@ -1,5 +1,6 @@
 import argparse
 import hashlib
+import inspect
 import random
 import time
 from contextlib import contextmanager
@@ -35,6 +36,13 @@ def nvtx_range(name: str):
 
 
 _CURRENT_PROFILE_PHASE: str | None = None
+_PACKED_VERIFY_CAPABILITY_CACHE: dict[int, bool] = {}
+_PACKED_VERIFY_FALLBACK_WARNED_TARGETS: set[int] = set()
+STAGE_C_PACKED_METADATA_REQUIREMENT = (
+    "stage_c_full_speculative packed verify path requires target.forward to accept "
+    "slot_mapping/context_lens/block_tables kwargs (or **kwargs). "
+    "If unsupported, benchmark.py auto-falls back to stage_b_target_only compatibility path."
+)
 
 
 @contextmanager
@@ -507,6 +515,36 @@ def prepare_packed_verify_inputs(
     }
 
 
+def _supports_packed_verify_kwargs(target: AutoModelForCausalLM) -> bool:
+    target_id = id(target)
+    if target_id in _PACKED_VERIFY_CAPABILITY_CACHE:
+        return _PACKED_VERIFY_CAPABILITY_CACHE[target_id]
+
+    probes = [getattr(target, "forward", None), getattr(target, "__call__", None)]
+    required_kwargs = {"slot_mapping", "context_lens", "block_tables"}
+    for probe in probes:
+        if probe is None:
+            continue
+        try:
+            signature = inspect.signature(probe)
+        except (TypeError, ValueError):
+            continue
+        has_var_kwargs = any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in signature.parameters.values()
+        )
+        supports = has_var_kwargs or required_kwargs.issubset(signature.parameters)
+        _PACKED_VERIFY_CAPABILITY_CACHE[target_id] = supports
+        return supports
+
+    _PACKED_VERIFY_CAPABILITY_CACHE[target_id] = False
+    return False
+
+
+def _is_packed_kwargs_typeerror(exc: TypeError) -> bool:
+    message = str(exc)
+    return any(token in message for token in ["slot_mapping", "context_lens", "block_tables"])
+
+
 def build_verify_batch_inputs(
     block_output_ids: torch.Tensor,
     block_position_ids: torch.Tensor,
@@ -729,19 +767,47 @@ def target_verify_step(
         )
     validate_cache_batch_size(active_target_cache, input_batch_size, "past_key_values_target")
 
+    verify_kwargs = {
+        "attention_mask": verify_mask,
+        "position_ids": verify_position_ids,
+        "past_key_values": active_target_cache,
+        "use_cache": True,
+        "output_hidden_states": True if block_size > 1 else False,
+    }
+    packed_verify_supported = _supports_packed_verify_kwargs(target)
+    if not packed_verify_supported and id(target) not in _PACKED_VERIFY_FALLBACK_WARNED_TARGETS:
+        logger.warning(
+            "target verify packed metadata is unavailable; using dense compatibility verify path"
+        )
+        _PACKED_VERIFY_FALLBACK_WARNED_TARGETS.add(id(target))
+    if packed_verify_supported:
+        verify_kwargs.update(
+            {
+                "slot_mapping": slot_mapping,
+                "context_lens": context_lens,
+                "block_tables": block_tables,
+            }
+        )
+
     with profile_phase("target.verify"):
         with nvtx_range("target.verify.forward"):
-            output = target(
-                verify_input_ids,
-                attention_mask=verify_mask,
-                position_ids=verify_position_ids,
-                past_key_values=active_target_cache,
-                use_cache=True,
-                output_hidden_states=True if block_size > 1 else False,
-                slot_mapping=slot_mapping,
-                context_lens=context_lens,
-                block_tables=block_tables,
-            )
+            try:
+                output = target(verify_input_ids, **verify_kwargs)
+            except TypeError as exc:
+                if not packed_verify_supported and not _is_packed_kwargs_typeerror(exc):
+                    raise
+                if packed_verify_supported and not _is_packed_kwargs_typeerror(exc):
+                    raise
+                _PACKED_VERIFY_CAPABILITY_CACHE[id(target)] = False
+                verify_kwargs.pop("slot_mapping", None)
+                verify_kwargs.pop("context_lens", None)
+                verify_kwargs.pop("block_tables", None)
+                if id(target) not in _PACKED_VERIFY_FALLBACK_WARNED_TARGETS:
+                    logger.warning(
+                        "target verify does not support packed metadata kwargs (slot_mapping/context_lens/block_tables); falling back to dense compatibility verify path"
+                    )
+                    _PACKED_VERIFY_FALLBACK_WARNED_TARGETS.add(id(target))
+                output = target(verify_input_ids, **verify_kwargs)
 
     target_logits = output.logits.clone()
     target_logits = target_logits.masked_fill(verify_mask.unsqueeze(-1) == 0, -torch.inf)
@@ -1228,7 +1294,23 @@ def dflash_generate_batch_with_mode(
             temperature=temperature,
         )
     if batched_decode_mode == "stage_c_full_speculative":
-        return dflash_generate_batch_staged(
+        if _supports_packed_verify_kwargs(target):
+            return dflash_generate_batch_staged(
+                model=model,
+                target=target,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                input_lengths=input_lengths,
+                mask_token_id=mask_token_id,
+                max_new_tokens=max_new_tokens,
+                block_size=block_size,
+                stop_token_ids=stop_token_ids,
+                temperature=temperature,
+            )
+        logger.warning(
+            "batched-decode-mode=stage_c_full_speculative requires target verify packed metadata kwargs; auto-fallback to stage_b_target_only compatibility path"
+        )
+        return dflash_generate_batch_stage_b_target_only(
             model=model,
             target=target,
             input_ids=input_ids,
@@ -1328,9 +1410,11 @@ def main() -> None:
             "stage_b_target_only",
             "stage_c_full_speculative",
         ],
-        help="staged rollout mode for batched decode; use legacy for fast rollback",
+        help=f"staged rollout mode for batched decode; use legacy for fast rollback. {STAGE_C_PACKED_METADATA_REQUIREMENT}",
     )
     args = parser.parse_args()
+
+    logger.info("{}", STAGE_C_PACKED_METADATA_REQUIREMENT)
 
     if args.batch_size < 1:
         raise ValueError("--batch-size must be >= 1")
