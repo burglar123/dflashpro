@@ -114,7 +114,7 @@ def cuda_time() -> float:
 class BatchDecodeState:
     output_ids: torch.Tensor
     input_lengths: torch.Tensor
-    start_pos: int
+    start_pos: torch.Tensor
     finished_mask: torch.Tensor
     active_indices: torch.Tensor
     acceptance_lengths_per_row: list[list[int]]
@@ -125,6 +125,43 @@ class BatchDecodeState:
     target_hidden: torch.Tensor | None
     decode_start: float
     draft_prefill: bool
+
+
+def gather_active_rows(cache: DynamicCache, active_indices: torch.Tensor) -> DynamicCache:
+    gathered_cache = DynamicCache()
+    gathered_cache.key_cache = [key.index_select(0, active_indices) for key in cache.key_cache]
+    gathered_cache.value_cache = [value.index_select(0, active_indices) for value in cache.value_cache]
+    if hasattr(cache, "_seen_tokens"):
+        gathered_cache._seen_tokens = cache._seen_tokens
+    return gathered_cache
+
+
+def scatter_back_rows(
+    full_cache: DynamicCache,
+    active_cache: DynamicCache,
+    active_indices: torch.Tensor,
+) -> None:
+    if len(full_cache.key_cache) != len(active_cache.key_cache):
+        raise ValueError("cache layer count mismatch while scattering active rows")
+    for layer_idx, (full_key, active_key) in enumerate(zip(full_cache.key_cache, active_cache.key_cache)):
+        if full_key.shape[0] <= int(active_indices.max().item()):
+            raise ValueError(f"invalid active index for key cache layer {layer_idx}")
+        full_key.index_copy_(0, active_indices, active_key)
+    for full_value, active_value in zip(full_cache.value_cache, active_cache.value_cache):
+        full_value.index_copy_(0, active_indices, active_value)
+
+
+def validate_cache_batch_size(cache: DynamicCache, expected_batch: int, cache_name: str) -> None:
+    for layer_idx, key in enumerate(cache.key_cache):
+        if key.shape[0] != expected_batch:
+            raise ValueError(
+                f"{cache_name} layer {layer_idx} batch={key.shape[0]}, expected active batch={expected_batch}"
+            )
+    for layer_idx, value in enumerate(cache.value_cache):
+        if value.shape[0] != expected_batch:
+            raise ValueError(
+                f"{cache_name} layer {layer_idx} value batch={value.shape[0]}, expected active batch={expected_batch}"
+            )
 
 
 def collate_prompts(
@@ -224,7 +261,7 @@ def init_batch_state(
     state = BatchDecodeState(
         output_ids=output_ids,
         input_lengths=input_lengths,
-        start_pos=num_input_tokens,
+        start_pos=torch.full((batch_size,), num_input_tokens, device=model.device, dtype=torch.long),
         finished_mask=torch.zeros(batch_size, dtype=torch.bool, device=model.device),
         active_indices=torch.arange(batch_size, device=model.device, dtype=torch.long),
         acceptance_lengths_per_row=[[] for _ in range(batch_size)],
@@ -245,28 +282,39 @@ def draft_propose_step(
     target: AutoModelForCausalLM,
     state: BatchDecodeState,
     block_size: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert state.output_ids.ndim == 2
     assert state.active_indices.ndim == 1
-    assert state.start_pos < state.max_length
 
-    block_output_ids = state.output_ids[:, state.start_pos : state.start_pos + block_size].clone()
-    block_position_ids = state.position_ids[:, state.start_pos : state.start_pos + block_size]
-    assert block_output_ids.ndim == 2 and block_output_ids.shape[0] == state.output_ids.shape[0]
+    active_indices = state.active_indices
+    active_batch = int(active_indices.numel())
+    assert active_batch > 0, "active batch must be non-empty"
+    active_start_pos = state.start_pos.index_select(0, active_indices)
+    assert torch.unique(active_start_pos).numel() == 1, "active rows must share start_pos"
+    active_start_pos_scalar = int(active_start_pos[0].item())
+    assert active_start_pos_scalar < state.max_length
+
+    block_output_ids = state.output_ids.index_select(0, active_indices)[:, active_start_pos_scalar : active_start_pos_scalar + block_size].clone()
+    block_position_ids = state.position_ids[:, active_start_pos_scalar : active_start_pos_scalar + block_size].expand(active_batch, -1)
+    assert block_output_ids.ndim == 2 and block_output_ids.shape[0] == active_batch
+
+    active_draft_cache = gather_active_rows(state.past_key_values_draft, active_indices)
+    validate_cache_batch_size(active_draft_cache, active_batch, "past_key_values_draft")
 
     if block_size > 1:
         assert state.target_hidden is not None and state.target_hidden.ndim == 3
+        active_target_hidden = state.target_hidden.index_select(0, active_indices)
         with profile_phase("draft"):
             with nvtx_range("draft.forward"):
                 noise_embedding = target.model.embed_tokens(block_output_ids)
                 assert noise_embedding.ndim == 3 and noise_embedding.shape[:2] == block_output_ids.shape
                 draft_hidden = model(
-                    target_hidden=state.target_hidden,
+                    target_hidden=active_target_hidden,
                     noise_embedding=noise_embedding,
                     position_ids=state.position_ids[
-                        :, state.past_key_values_draft.get_seq_length() : state.start_pos + block_size
-                    ],
-                    past_key_values=state.past_key_values_draft,
+                        :, active_draft_cache.get_seq_length() : active_start_pos_scalar + block_size
+                    ].expand(active_batch, -1),
+                    past_key_values=active_draft_cache,
                     use_cache=True,
                     is_causal=False,
                 )
@@ -274,13 +322,15 @@ def draft_propose_step(
             draft_logits = target.lm_head(draft_hidden[:, -block_size + 1 :, :])
         assert draft_logits.ndim == 3 and draft_logits.shape[0] == block_output_ids.shape[0]
         with nvtx_range("kv_update.draft_cache"):
-            state.past_key_values_draft.crop(state.start_pos)
+            active_draft_cache.crop(active_start_pos_scalar)
+            validate_cache_batch_size(active_draft_cache, active_batch, "past_key_values_draft")
+            scatter_back_rows(state.past_key_values_draft, active_draft_cache, active_indices)
         block_output_ids[:, 1:] = sample(draft_logits)
         if state.draft_prefill:
             state.draft_prefill = False
             state.decode_start = cuda_time()
 
-    return block_output_ids, block_position_ids
+    return block_output_ids, block_position_ids, active_indices
 
 
 @torch.inference_mode()
@@ -288,22 +338,27 @@ def target_verify_step(
     model: DFlashDraftModel,
     target: AutoModelForCausalLM,
     state: BatchDecodeState,
+    active_indices: torch.Tensor,
     block_output_ids: torch.Tensor,
     block_position_ids: torch.Tensor,
     block_size: int,
     temperature: float,
-) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor | None, DynamicCache]:
     assert block_output_ids.ndim == 2 and block_position_ids.ndim == 2
-    assert block_output_ids.shape[0] == state.output_ids.shape[0]
+    active_batch = int(active_indices.numel())
+    assert block_output_ids.shape[0] == active_batch
     assert block_output_ids.shape[1] == block_size
-    assert block_position_ids.shape[1] == block_size
+    assert block_position_ids.shape[0] == active_batch and block_position_ids.shape[1] == block_size
+
+    active_target_cache = gather_active_rows(state.past_key_values_target, active_indices)
+    validate_cache_batch_size(active_target_cache, active_batch, "past_key_values_target")
 
     with profile_phase("target.verify"):
         with nvtx_range("target.verify.forward"):
             output = target(
                 block_output_ids,
                 position_ids=block_position_ids,
-                past_key_values=state.past_key_values_target,
+                past_key_values=active_target_cache,
                 use_cache=True,
                 output_hidden_states=True if block_size > 1 else False,
             )
@@ -316,36 +371,49 @@ def target_verify_step(
         target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)
         assert target_hidden.ndim == 3 and target_hidden.shape[0] == block_output_ids.shape[0]
 
-    return posterior, target_hidden, block_output_ids
+    return posterior, target_hidden, active_target_cache
 
 
 def apply_acceptance_step(
     state: BatchDecodeState,
+    active_indices: torch.Tensor,
     block_output_ids: torch.Tensor,
     posterior: torch.Tensor,
     target_hidden: torch.Tensor | None,
+    active_target_cache: DynamicCache,
     block_size: int,
 ) -> None:
     assert block_output_ids.ndim == 2 and posterior.ndim == 2
-    assert block_output_ids.shape[0] == posterior.shape[0] == state.output_ids.shape[0]
+    active_batch = int(active_indices.numel())
+    assert block_output_ids.shape[0] == posterior.shape[0] == active_batch
     acceptance_lengths = (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)
-    assert acceptance_lengths.ndim == 1 and acceptance_lengths.shape[0] == state.output_ids.shape[0]
+    assert acceptance_lengths.ndim == 1 and acceptance_lengths.shape[0] == active_batch
     assert torch.unique(acceptance_lengths).numel() == 1, "Current cache update requires synced acceptance"
 
-    acceptance_length = acceptance_lengths[0].item()
-    state.output_ids[:, state.start_pos : state.start_pos + acceptance_length + 1] = block_output_ids[
-        :, : acceptance_length + 1
-    ]
-    state.output_ids[:, state.start_pos + acceptance_length + 1] = posterior[:, acceptance_length]
+    acceptance_length = int(acceptance_lengths[0].item())
+    active_start_pos = state.start_pos.index_select(0, active_indices)
+    assert torch.unique(active_start_pos).numel() == 1, "active rows must share start_pos"
+    active_start_pos_scalar = int(active_start_pos[0].item())
 
-    for row in range(state.output_ids.shape[0]):
+    state.output_ids[active_indices, active_start_pos_scalar : active_start_pos_scalar + acceptance_length + 1] = (
+        block_output_ids[:, : acceptance_length + 1]
+    )
+    state.output_ids[active_indices, active_start_pos_scalar + acceptance_length + 1] = posterior[:, acceptance_length]
+
+    for row in active_indices.tolist():
         state.acceptance_lengths_per_row[row].append(acceptance_length + 1)
 
-    state.start_pos += acceptance_length + 1
+    state.start_pos[active_indices] = state.start_pos.index_select(0, active_indices) + (acceptance_length + 1)
     with nvtx_range("kv_update.target_cache"):
-        state.past_key_values_target.crop(state.start_pos)
+        new_start_pos_scalar = int(state.start_pos[active_indices][0].item())
+        active_target_cache.crop(new_start_pos_scalar)
+        validate_cache_batch_size(active_target_cache, active_batch, "past_key_values_target")
+        scatter_back_rows(state.past_key_values_target, active_target_cache, active_indices)
     if block_size > 1 and target_hidden is not None:
-        state.target_hidden = target_hidden[:, : acceptance_length + 1, :]
+        if state.target_hidden is None:
+            raise ValueError("target_hidden must be initialized when block_size > 1")
+        state.target_hidden[active_indices] = target_hidden[:, : acceptance_length + 1, :]
+
 
 
 def finalize_outputs(
@@ -438,17 +506,29 @@ def dflash_generate_batch_staged(
         temperature=temperature,
     )
 
-    while state.start_pos < state.max_length:
-        block_output_ids, block_position_ids = draft_propose_step(
+    while True:
+        state.finished_mask = state.start_pos >= state.max_length
+        if stop_token_ids is not None:
+            stop_tokens = torch.tensor(stop_token_ids, device=state.output_ids.device)
+            last_positions = torch.clamp(state.start_pos - 1, min=0)
+            last_tokens = state.output_ids[torch.arange(state.output_ids.shape[0], device=state.output_ids.device), last_positions]
+            state.finished_mask |= torch.isin(last_tokens, stop_tokens)
+
+        state.active_indices = (~state.finished_mask).nonzero(as_tuple=True)[0]
+        if state.active_indices.numel() == 0:
+            break
+
+        block_output_ids, block_position_ids, active_indices = draft_propose_step(
             model=model,
             target=target,
             state=state,
             block_size=block_size,
         )
-        posterior, target_hidden, _ = target_verify_step(
+        posterior, target_hidden, active_target_cache = target_verify_step(
             model=model,
             target=target,
             state=state,
+            active_indices=active_indices,
             block_output_ids=block_output_ids,
             block_position_ids=block_position_ids,
             block_size=block_size,
@@ -456,17 +536,13 @@ def dflash_generate_batch_staged(
         )
         apply_acceptance_step(
             state=state,
+            active_indices=active_indices,
             block_output_ids=block_output_ids,
             posterior=posterior,
             target_hidden=target_hidden,
+            active_target_cache=active_target_cache,
             block_size=block_size,
         )
-
-        if stop_token_ids is not None and any(
-            stop_token_id in state.output_ids[:, int(state.input_lengths.min().item()) :]
-            for stop_token_id in stop_token_ids
-        ):
-            break
 
     return finalize_outputs(
         state=state,
