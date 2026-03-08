@@ -404,6 +404,33 @@ def validate_cache_batch_size(cache: DynamicCache, expected_batch: int, cache_na
             )
 
 
+def block_table_context_len(sequence: Sequence) -> int:
+    if not sequence.block_table:
+        return 0
+    return sequence.block_table[-1].logical_end
+
+
+def validate_sequence_runtime_consistency(
+    sequence: Sequence,
+    forward_visible_context_len: int,
+    block_manager: BlockManager,
+) -> None:
+    block_manager.check_consistency(sequence)
+    table_context_len = block_table_context_len(sequence)
+    if sequence.num_cached_tokens != table_context_len:
+        raise ValueError(
+            f"sequence {sequence.seq_id} logical/table mismatch: "
+            f"num_cached_tokens={sequence.num_cached_tokens}, table_context_len={table_context_len}"
+        )
+    expected_forward_visible_context_len = sequence.num_cached_tokens + (1 if sequence.pre_verify else 0)
+    if expected_forward_visible_context_len != forward_visible_context_len:
+        raise ValueError(
+            f"sequence {sequence.seq_id} logical/forward mismatch: "
+            f"expected_forward_visible_context_len={expected_forward_visible_context_len}, "
+            f"forward_visible_context_len={forward_visible_context_len}, pre_verify={sequence.pre_verify}"
+        )
+
+
 def collate_prompts(
     input_ids_list: list[torch.Tensor],
     pad_token_id: int,
@@ -603,7 +630,7 @@ def draft_propose_step(
                     target_hidden=active_target_hidden,
                     noise_embedding=noise_embedding,
                     position_ids=state.position_ids[
-                        :, active_draft_cache.get_seq_length() : active_start_pos_scalar + block_size
+                        :, active_start_pos_scalar : active_start_pos_scalar + block_size
                     ].expand(active_batch, -1),
                     past_key_values=active_draft_cache,
                     use_cache=True,
@@ -612,10 +639,6 @@ def draft_propose_step(
         with nvtx_range("draft.output_head"):
             draft_logits = target.lm_head(draft_hidden[:, -block_size + 1 :, :])
         assert draft_logits.ndim == 3 and draft_logits.shape[0] == block_output_ids.shape[0]
-        with nvtx_range("kv_update.draft_cache"):
-            active_draft_cache.crop(active_start_pos_scalar)
-            validate_cache_batch_size(active_draft_cache, active_batch, "past_key_values_draft")
-            scatter_back_rows(state.past_key_values_draft, active_draft_cache, active_indices)
         block_output_ids[:, 1:] = sample(draft_logits)
         if state.draft_prefill:
             state.draft_prefill = False
@@ -762,8 +785,6 @@ def apply_acceptance_step(
     state.finished_mask[active_indices] |= state.start_pos.index_select(0, active_indices) >= state.max_length
 
     with nvtx_range("kv_update.target_cache"):
-        new_start_pos_scalar = int(state.start_pos[active_indices][0].item())
-        active_target_cache.crop(new_start_pos_scalar)
         validate_cache_batch_size(active_target_cache, active_batch, "past_key_values_target")
         scatter_back_rows(state.past_key_values_target, active_target_cache, active_indices)
     if block_size > 1 and target_hidden is not None:
@@ -905,7 +926,11 @@ def dflash_generate_batch_staged(
 
     while scheduler.has_pending():
         for sequence in sequences:
-            block_manager.check_consistency(sequence)
+            validate_sequence_runtime_consistency(
+                sequence=sequence,
+                forward_visible_context_len=len(sequence.token_ids),
+                block_manager=block_manager,
+            )
         scheduled_batch = scheduler.schedule_next_batch(max_batch_size=state.output_ids.shape[0])
         if not scheduled_batch:
             break
@@ -979,6 +1004,13 @@ def dflash_generate_batch_staged(
             state.finished_mask[row] = seq.finished
             if seq.finished:
                 scheduler.mark_finished(seq)
+
+        for sequence in sequences:
+            validate_sequence_runtime_consistency(
+                sequence=sequence,
+                forward_visible_context_len=len(sequence.token_ids),
+                block_manager=block_manager,
+            )
 
     return finalize_outputs(
         state=state,
@@ -1109,7 +1141,6 @@ def dflash_generate_batch_stage_b_target_only(
         state.start_pos[active_indices] = active_start_pos + 1
 
         with nvtx_range("kv_update.target_cache"):
-            active_target_cache.crop(active_start_pos_scalar + 1)
             validate_cache_batch_size(active_target_cache, active_batch, "past_key_values_target")
             scatter_back_rows(state.past_key_values_target, active_target_cache, active_indices)
 
