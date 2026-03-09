@@ -392,6 +392,8 @@ def test_target_verify_step_handles_ragged_verify_lengths_without_misalignment()
 
 
 def test_target_verify_step_falls_back_when_target_does_not_support_packed_metadata_kwargs():
+    import benchmark as benchmark_module
+
     model = DummyDraftModel(device=torch.device("cpu"))
     target = DummyTargetModelNoPackedKwargs(vocab_size=256)
 
@@ -444,6 +446,7 @@ def test_target_verify_step_falls_back_when_target_does_not_support_packed_metad
 
     assert acceptance_len_vec.tolist() == [0, 2]
     assert posterior.shape == torch.Size([2, 3])
+    assert benchmark_module._supports_packed_verify_kwargs(target) is False
 
 
 def test_stage_c_mode_auto_falls_back_to_stage_b_when_packed_metadata_is_unsupported(monkeypatch):
@@ -473,9 +476,49 @@ def test_stage_c_mode_auto_falls_back_to_stage_b_when_packed_metadata_is_unsuppo
         stop_token_ids=[255],
         temperature=0.0,
         batched_decode_mode="stage_c_full_speculative",
+        enable_multi_start_pos_grouping=True,
     )
 
     assert called["stage_b"] is True
+
+
+def test_stage_c_mode_uses_packed_branch_when_supported(monkeypatch):
+    import benchmark as benchmark_module
+
+    model = DummyDraftModel(device=torch.device("cpu"))
+    target = DummyTargetModel(vocab_size=256)
+    prompt = torch.tensor([[10, 11, 12]], dtype=torch.long)
+
+    called = {"stage_c": False, "stage_b": False}
+
+    def fake_stage_c(**kwargs):
+        called["stage_c"] = True
+        return [SimpleNamespace(output_ids=prompt, num_input_tokens=3, num_output_tokens=0, time_to_first_token=0.0, time_per_output_token=0.0, acceptance_lengths=[], active_batch_size_trace=[], grouped_batch_count_trace=[], grouped_batch_sizes_trace=[])]
+
+    def fake_stage_b(**kwargs):
+        called["stage_b"] = True
+        return [SimpleNamespace(output_ids=prompt, num_input_tokens=3, num_output_tokens=0, time_to_first_token=0.0, time_per_output_token=0.0, acceptance_lengths=[], active_batch_size_trace=[], grouped_batch_count_trace=[], grouped_batch_sizes_trace=[])]
+
+    monkeypatch.setattr(benchmark_module, "dflash_generate_batch_staged", fake_stage_c)
+    monkeypatch.setattr(benchmark_module, "dflash_generate_batch_stage_b_target_only", fake_stage_b)
+
+    benchmark_module.dflash_generate_batch_with_mode(
+        model=model,
+        target=target,
+        input_ids=prompt,
+        attention_mask=torch.ones_like(prompt),
+        input_lengths=torch.tensor([3], dtype=torch.long),
+        mask_token_id=model.mask_token_id,
+        max_new_tokens=2,
+        block_size=2,
+        stop_token_ids=[255],
+        temperature=0.0,
+        batched_decode_mode="stage_c_full_speculative",
+        enable_multi_start_pos_grouping=True,
+    )
+
+    assert called["stage_c"] is True
+    assert called["stage_b"] is False
 
 def _build_sequence(seq_id: int, token_ids: list[int], num_cached_tokens: int) -> Sequence:
     return Sequence(
