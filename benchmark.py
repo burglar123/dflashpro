@@ -38,6 +38,10 @@ def nvtx_range(name: str):
 _CURRENT_PROFILE_PHASE: str | None = None
 _PACKED_VERIFY_CAPABILITY_CACHE: dict[int, bool] = {}
 _PACKED_VERIFY_FALLBACK_WARNED_TARGETS: set[int] = set()
+_PACKED_VERIFY_PATH_STATS = {
+    "packed": {"tokens": 0, "time": 0.0},
+    "fallback": {"tokens": 0, "time": 0.0},
+}
 STAGE_C_PACKED_METADATA_REQUIREMENT = (
     "stage_c_full_speculative packed verify path requires target.forward to accept "
     "slot_mapping/context_lens/block_tables kwargs (or **kwargs). "
@@ -857,6 +861,8 @@ def target_verify_step(
             }
         )
 
+    verify_path = "packed" if packed_verify_supported else "fallback"
+    verify_start = cuda_time()
     with profile_phase("target.verify"):
         with nvtx_range("target.verify.forward"):
             try:
@@ -875,7 +881,12 @@ def target_verify_step(
                         "target verify does not support packed metadata kwargs (slot_mapping/context_lens/block_tables); falling back to dense compatibility verify path"
                     )
                     _PACKED_VERIFY_FALLBACK_WARNED_TARGETS.add(id(target))
+                verify_path = "fallback"
                 output = target(verify_input_ids, **verify_kwargs)
+    verify_elapsed = cuda_time() - verify_start
+    verify_token_count = int(verify_mask.sum().item())
+    _PACKED_VERIFY_PATH_STATS[verify_path]["tokens"] += verify_token_count
+    _PACKED_VERIFY_PATH_STATS[verify_path]["time"] += float(verify_elapsed)
 
     target_logits = output.logits.clone()
     target_logits = target_logits.masked_fill(verify_mask.unsqueeze(-1) == 0, -torch.inf)
@@ -1549,6 +1560,10 @@ def main() -> None:
     args = parser.parse_args()
 
     logger.info("{}", STAGE_C_PACKED_METADATA_REQUIREMENT)
+    _PACKED_VERIFY_PATH_STATS["packed"]["tokens"] = 0
+    _PACKED_VERIFY_PATH_STATS["packed"]["time"] = 0.0
+    _PACKED_VERIFY_PATH_STATS["fallback"]["tokens"] = 0
+    _PACKED_VERIFY_PATH_STATS["fallback"]["time"] = 0.0
 
     if args.batch_size < 1:
         raise ValueError("--batch-size must be >= 1")
@@ -1588,6 +1603,8 @@ def main() -> None:
         attn_implementation="flash_attention_2" if installed_flash_attn else "sdpa",
         dtype=torch.bfloat16,
     ).to(device).eval()
+    packed_verify_supported = _supports_packed_verify_kwargs(target)
+    print(f"packed_verify_supported={packed_verify_supported}")
 
     # Required profiling ranges:
     # - draft.qkv / draft.attn / draft.ffn
@@ -1725,6 +1742,20 @@ def main() -> None:
     throughput_spec = compute_throughput_tokens_per_second(speculative_responses)
     throughput_speedup = throughput_spec / throughput_baseline
     print(f"Throughput tokens/s baseline={throughput_baseline:.2f}, speculative={throughput_spec:.2f}, speedup={throughput_speedup:.2f}")
+    packed_tokens = _PACKED_VERIFY_PATH_STATS["packed"]["tokens"]
+    packed_time = _PACKED_VERIFY_PATH_STATS["packed"]["time"]
+    fallback_tokens = _PACKED_VERIFY_PATH_STATS["fallback"]["tokens"]
+    fallback_time = _PACKED_VERIFY_PATH_STATS["fallback"]["time"]
+    packed_throughput = float(packed_tokens / packed_time) if packed_time > 0 else float("nan")
+    fallback_throughput = (
+        float(fallback_tokens / fallback_time) if fallback_time > 0 else float("nan")
+    )
+    print(f"packed_verify_supported={packed_verify_supported}")
+    print(
+        "Verify path throughput tokens/s "
+        f"packed={packed_throughput:.2f} (tokens={packed_tokens}), "
+        f"fallback={fallback_throughput:.2f} (tokens={fallback_tokens})"
+    )
     if block_size >= 4 and throughput_speedup < args.throughput_min_speedup:
         raise RuntimeError(
             f"Performance gate failed for block_size={block_size}: throughput speedup {throughput_speedup:.2f} < {args.throughput_min_speedup:.2f}"
