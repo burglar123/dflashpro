@@ -279,7 +279,8 @@ class Scheduler:
         self,
         max_batch_tokens: int | None = None,
         max_batch_size: int | None = None,
-    ) -> list[Sequence]:
+        return_grouped: bool = False,
+    ) -> list[Sequence] | list[list[Sequence]]:
         while self.waiting:
             self.running.append(self.waiting.pop(0))
 
@@ -287,20 +288,24 @@ class Scheduler:
             return []
 
         self.running.sort(key=lambda seq: (seq.num_cached_tokens, seq.seq_id))
-        anchor_pos = self.running[0].num_cached_tokens
-
-        selected: list[Sequence] = []
+        selected_groups: dict[int, list[Sequence]] = {}
         selected_tokens = 0
         for seq in self.running:
-            if seq.finished or seq.num_cached_tokens != anchor_pos:
+            if seq.finished:
                 continue
-            if max_batch_size is not None and len(selected) >= max_batch_size:
+            if max_batch_size is not None and selected_tokens >= max_batch_size:
                 break
             if max_batch_tokens is not None and selected_tokens + 1 > max_batch_tokens:
                 break
-            selected.append(seq)
+            selected_groups.setdefault(seq.num_cached_tokens, []).append(seq)
             selected_tokens += 1
-        return selected
+
+        if not selected_groups:
+            return []
+        grouped_batches = [selected_groups[pos] for pos in sorted(selected_groups)]
+        if return_grouped:
+            return grouped_batches
+        return grouped_batches[0]
 
     def mark_finished(self, seq: Sequence) -> None:
         seq.finished = True
@@ -358,6 +363,8 @@ class BatchDecodeState:
     decode_start: float
     draft_prefill: bool
     active_batch_size_trace: list[int]
+    grouped_batch_count_trace: list[int]
+    grouped_batch_sizes_trace: list[list[int]]
 
 
 BatchedDecodeMode = Literal[
@@ -718,6 +725,8 @@ def init_batch_state(
         decode_start=cuda_time(),
         draft_prefill=True,
         active_batch_size_trace=[],
+        grouped_batch_count_trace=[],
+        grouped_batch_sizes_trace=[],
     )
     return state, state.decode_start - prefill_start
 
@@ -986,6 +995,8 @@ def finalize_outputs(
                 time_per_output_token=time_per_output_token,
                 acceptance_lengths=state.acceptance_lengths_per_row[row],
                 active_batch_size_trace=state.active_batch_size_trace.copy(),
+                grouped_batch_count_trace=state.grouped_batch_count_trace.copy(),
+                grouped_batch_sizes_trace=[sizes.copy() for sizes in state.grouped_batch_sizes_trace],
             )
         )
 
@@ -1033,6 +1044,7 @@ def dflash_generate_batch_staged(
     block_size: int,
     stop_token_ids: list[int] | None,
     temperature: float = 0.0,
+    enable_multi_start_pos_grouping: bool = True,
 ) -> list[SimpleNamespace]:
     block_manager = BlockManager(block_size=block_size)
     state, time_to_first_token = init_batch_state(
@@ -1075,84 +1087,95 @@ def dflash_generate_batch_staged(
                 forward_visible_context_len=len(sequence.token_ids),
                 block_manager=block_manager,
             )
-        scheduled_batch = scheduler.schedule_next_batch(max_batch_size=state.output_ids.shape[0])
-        if not scheduled_batch:
+        if enable_multi_start_pos_grouping:
+            scheduled_groups = scheduler.schedule_next_batch(
+                max_batch_size=state.output_ids.shape[0],
+                return_grouped=True,
+            )
+        else:
+            scheduled_batch = scheduler.schedule_next_batch(max_batch_size=state.output_ids.shape[0])
+            scheduled_groups = [scheduled_batch] if scheduled_batch else []
+        if not scheduled_groups:
             break
 
-        state.active_indices = torch.tensor(
-            [seq.seq_id for seq in scheduled_batch],
-            dtype=torch.long,
-            device=state.output_ids.device,
-        )
-        state.active_batch_size_trace.append(int(state.active_indices.numel()))
+        state.grouped_batch_count_trace.append(len(scheduled_groups))
+        state.grouped_batch_sizes_trace.append([len(group) for group in scheduled_groups])
 
-        block_output_ids, block_position_ids, active_indices = draft_propose_step(
-            model=model,
-            target=target,
-            state=state,
-            scheduled_batch=scheduled_batch,
-            block_size=block_size,
-        )
+        for scheduled_batch in scheduled_groups:
+            state.active_indices = torch.tensor(
+                [seq.seq_id for seq in scheduled_batch],
+                dtype=torch.long,
+                device=state.output_ids.device,
+            )
+            state.active_batch_size_trace.append(int(state.active_indices.numel()))
 
-        for local_row, seq in enumerate(scheduled_batch):
-            scheduler.append_draft_tokens(seq.seq_id, block_output_ids[local_row].tolist())
-
-        posterior, acceptance_len_vec, target_hidden, active_target_cache = target_verify_step(
-            model=model,
-            target=target,
-            state=state,
-            scheduled_batch=scheduled_batch,
-            active_indices=active_indices,
-            block_output_ids=block_output_ids,
-            block_position_ids=block_position_ids,
-            block_size=block_size,
-            temperature=temperature,
-        )
-        apply_acceptance_step(
-            state=state,
-            active_indices=active_indices,
-            block_output_ids=block_output_ids,
-            posterior=posterior,
-            acceptance_len_vec=acceptance_len_vec,
-            target_hidden=target_hidden,
-            active_target_cache=active_target_cache,
-            block_size=block_size,
-        )
-
-        for local_row, row in enumerate(active_indices.tolist()):
-            seq = sequences[row]
-            seq.pre_verify = False
-            accepted_len = int(acceptance_len_vec[local_row].item()) + 1
-            seq.num_acc_tokens += accepted_len
-
-            txn = scheduler.consume_draft_transaction(seq.seq_id)
-            draft_start = int(txn["start"])
-            accepted_tokens = block_output_ids[local_row, :accepted_len].tolist()
-            verify_token = int(posterior[local_row, accepted_len - 1].item())
-            seq.pending_kv_append.extend(accepted_tokens + [verify_token])
-
-            scheduler.rollback(seq.seq_id, draft_start + accepted_len)
-            seq.token_ids = seq.token_ids[: seq.num_cached_tokens] + [verify_token]
-            seq.num_cached_tokens += 1
-            commit_pending_kv(
-                sequence=seq,
-                block_manager=block_manager,
-                target_cache_view=state.past_key_values_target,
-                rollback_to=draft_start,
+            block_output_ids, block_position_ids, active_indices = draft_propose_step(
+                model=model,
+                target=target,
+                state=state,
+                scheduled_batch=scheduled_batch,
+                block_size=block_size,
             )
 
-            row_input_length = int(state.input_lengths[row].item())
-            reached_max_new_tokens = (seq.num_cached_tokens - row_input_length) >= max_new_tokens
-            no_available_position = seq.num_cached_tokens >= state.output_ids.shape[1] - 1
-            hit_stop_token = False
-            if stop_tokens is not None:
-                row_tokens = state.output_ids[row, row_input_length : seq.num_cached_tokens + 1]
-                hit_stop_token = row_tokens.numel() > 0 and bool(torch.isin(row_tokens, stop_tokens).any())
+            for local_row, seq in enumerate(scheduled_batch):
+                scheduler.append_draft_tokens(seq.seq_id, block_output_ids[local_row].tolist())
 
-            seq.finished = reached_max_new_tokens or no_available_position or hit_stop_token
-            state.finished_mask[row] = seq.finished
-            if seq.finished:
-                scheduler.mark_finished(seq)
+            posterior, acceptance_len_vec, target_hidden, active_target_cache = target_verify_step(
+                model=model,
+                target=target,
+                state=state,
+                scheduled_batch=scheduled_batch,
+                active_indices=active_indices,
+                block_output_ids=block_output_ids,
+                block_position_ids=block_position_ids,
+                block_size=block_size,
+                temperature=temperature,
+            )
+            apply_acceptance_step(
+                state=state,
+                active_indices=active_indices,
+                block_output_ids=block_output_ids,
+                posterior=posterior,
+                acceptance_len_vec=acceptance_len_vec,
+                target_hidden=target_hidden,
+                active_target_cache=active_target_cache,
+                block_size=block_size,
+            )
+
+            for local_row, row in enumerate(active_indices.tolist()):
+                seq = sequences[row]
+                seq.pre_verify = False
+                accepted_len = int(acceptance_len_vec[local_row].item()) + 1
+                seq.num_acc_tokens += accepted_len
+
+                txn = scheduler.consume_draft_transaction(seq.seq_id)
+                draft_start = int(txn["start"])
+                accepted_tokens = block_output_ids[local_row, :accepted_len].tolist()
+                verify_token = int(posterior[local_row, accepted_len - 1].item())
+                seq.pending_kv_append.extend(accepted_tokens + [verify_token])
+
+                scheduler.rollback(seq.seq_id, draft_start + accepted_len)
+                seq.token_ids = seq.token_ids[: seq.num_cached_tokens] + [verify_token]
+                seq.num_cached_tokens += 1
+                commit_pending_kv(
+                    sequence=seq,
+                    block_manager=block_manager,
+                    target_cache_view=state.past_key_values_target,
+                    rollback_to=draft_start,
+                )
+
+                row_input_length = int(state.input_lengths[row].item())
+                reached_max_new_tokens = (seq.num_cached_tokens - row_input_length) >= max_new_tokens
+                no_available_position = seq.num_cached_tokens >= state.output_ids.shape[1] - 1
+                hit_stop_token = False
+                if stop_tokens is not None:
+                    row_tokens = state.output_ids[row, row_input_length : seq.num_cached_tokens + 1]
+                    hit_stop_token = row_tokens.numel() > 0 and bool(torch.isin(row_tokens, stop_tokens).any())
+
+                seq.finished = reached_max_new_tokens or no_available_position or hit_stop_token
+                state.finished_mask[row] = seq.finished
+                if seq.finished:
+                    scheduler.mark_finished(seq)
 
         for sequence in sequences:
             validate_sequence_runtime_consistency(
@@ -1313,6 +1336,7 @@ def dflash_generate_batch_with_mode(
     stop_token_ids: list[int] | None,
     temperature: float,
     batched_decode_mode: BatchedDecodeMode,
+    enable_multi_start_pos_grouping: bool,
 ) -> list[SimpleNamespace]:
     if batched_decode_mode == "legacy":
         responses: list[SimpleNamespace] = []
@@ -1370,6 +1394,7 @@ def dflash_generate_batch_with_mode(
                 block_size=block_size,
                 stop_token_ids=stop_token_ids,
                 temperature=temperature,
+                enable_multi_start_pos_grouping=enable_multi_start_pos_grouping,
             )
         logger.warning(
             "batched-decode-mode=stage_c_full_speculative requires target verify packed metadata kwargs; auto-fallback to stage_b_target_only compatibility path"
@@ -1401,6 +1426,7 @@ def dflash_generate_batch(
     stop_token_ids: list[int] | None,
     temperature: float = 0.0,
     batched_decode_mode: BatchedDecodeMode = "stage_c_full_speculative",
+    enable_multi_start_pos_grouping: bool = True,
 ) -> list[SimpleNamespace]:
     return dflash_generate_batch_with_mode(
         model=model,
@@ -1414,6 +1440,7 @@ def dflash_generate_batch(
         stop_token_ids=stop_token_ids,
         temperature=temperature,
         batched_decode_mode=batched_decode_mode,
+        enable_multi_start_pos_grouping=enable_multi_start_pos_grouping,
     )
 
 
@@ -1445,6 +1472,44 @@ def aggregate_active_batch_trace(responses: list[SimpleNamespace]) -> list[int]:
     return trace
 
 
+def aggregate_grouped_batch_count_trace(responses: list[SimpleNamespace]) -> list[int]:
+    if not responses:
+        return []
+    max_steps = max(len(getattr(r, "grouped_batch_count_trace", [])) for r in responses)
+    if max_steps == 0:
+        return []
+    trace = []
+    for step in range(max_steps):
+        values = [
+            r.grouped_batch_count_trace[step]
+            for r in responses
+            if step < len(getattr(r, "grouped_batch_count_trace", []))
+        ]
+        trace.append(int(round(float(np.mean(values)))))
+    return trace
+
+
+def summarize_group_size_distribution(
+    responses: list[SimpleNamespace],
+) -> dict[int, float]:
+    group_sizes = list(
+        chain.from_iterable(
+            chain.from_iterable(getattr(r, "grouped_batch_sizes_trace", []))
+            for r in responses
+        )
+    )
+    if not group_sizes:
+        return {}
+    total = len(group_sizes)
+    return {
+        size: count / total
+        for size, count in sorted(
+            ((size, group_sizes.count(size)) for size in sorted(set(group_sizes))),
+            key=lambda item: item[0],
+        )
+    }
+
+
 def compute_throughput_tokens_per_second(responses: list[SimpleNamespace]) -> float:
     total_tokens = sum(r.num_output_tokens for r in responses)
     total_time = sum(r.time_per_output_token * max(r.num_output_tokens, 1) for r in responses)
@@ -1464,6 +1529,11 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--throughput-min-speedup", type=float, default=1.2)
+    parser.add_argument(
+        "--disable-multi-start-pos-grouping",
+        action="store_true",
+        help="fallback to legacy single start_pos group per decode round",
+    )
     parser.add_argument(
         "--batched-decode-mode",
         type=str,
@@ -1609,6 +1679,7 @@ def main() -> None:
                         stop_token_ids=[tokenizer.eos_token_id],
                         temperature=args.temperature,
                         batched_decode_mode=args.batched_decode_mode,
+                        enable_multi_start_pos_grouping=not args.disable_multi_start_pos_grouping,
                     )
 
             responses_by_row = {
@@ -1673,6 +1744,16 @@ def main() -> None:
 
     active_batch_trace = aggregate_active_batch_trace(speculative_responses)
     print(f"Active batch size trace (mean by decode step): {active_batch_trace}")
+
+    grouped_batch_count_trace = aggregate_grouped_batch_count_trace(speculative_responses)
+    print(f"Grouped batches per decode round (mean by decode step): {grouped_batch_count_trace}")
+
+    group_size_distribution = summarize_group_size_distribution(speculative_responses)
+    if group_size_distribution:
+        print(
+            "Group size distribution: "
+            + str({k: f"{v * 100:.1f}%" for k, v in group_size_distribution.items()})
+        )
 
     ttft_percentiles = summarize_latency_percentiles([r.time_to_first_token for r in speculative_responses])
     tpot_percentiles = summarize_latency_percentiles([r.time_per_output_token for r in speculative_responses])
